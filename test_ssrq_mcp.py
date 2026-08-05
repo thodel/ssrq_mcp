@@ -305,6 +305,18 @@ def test_server_module_registers_tools():
 
     args = server_module.parse_args(["--db", "/tmp/x.db", "--port", "9999"])
     tr.check(args.db == "/tmp/x.db" and args.port == 9999, "CLI flags override the env defaults")
+
+    # The endpoint path must match the public path exactly, however it is written:
+    # a sub-path deployment 404s when the app is mounted at /mcp while nginx
+    # forwards /mcp/ssrq/mcp.
+    n = server_module.normalise_path
+    tr.check(n("/mcp/ssrq/mcp") == "/mcp/ssrq/mcp", "an already-correct path is unchanged")
+    tr.check(n("mcp/ssrq/mcp") == "/mcp/ssrq/mcp", "a missing leading slash is added")
+    tr.check(n("/mcp/ssrq/mcp/") == "/mcp/ssrq/mcp", "a trailing slash is dropped")
+    tr.check(n("") == "/mcp" and n(None) == "/mcp", "an empty path falls back to /mcp")
+    tr.check(server_module.parse_args([]).http_path == "/mcp", "default endpoint path is /mcp")
+    tr.check(server_module.parse_args(["--http-path", "mcp/ssrq/mcp/"]).http_path
+             == "/mcp/ssrq/mcp", "--http-path is normalised on the way in")
     tr.assert_ok()
 
 

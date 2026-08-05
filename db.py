@@ -7,7 +7,10 @@ _DB_PATH = "ssrq.db"
 
 MAX_LIMIT = 500          # ceiling for any caller-supplied limit
 VARIANT_LIMIT = 500      # name variants attached to a single record
-ORG_INDEX_LIMIT = 9999   # rows in the ssrq://orgs resource
+# Rows in the ssrq://orgs resource. Kept well under the ~150k-character result
+# limit Claude.ai and Claude Desktop apply to a tool or resource payload: at 9999
+# rows this resource ran to roughly a megabyte and was silently unusable there.
+ORG_INDEX_LIMIT = 1000
 
 # The schema this server expects. The real database is produced by the SSRQ ETL
 # from the RDF-TTL dump; this constant is the contract that server and ETL share,

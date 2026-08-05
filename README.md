@@ -56,9 +56,12 @@ pip install -r requirements.txt
 python server.py --db ssrq.db --host 0.0.0.0 --port 8002
 ```
 
-Each flag also has an environment variable — `SSRQ_DB`, `SSRQ_HOST`, `SSRQ_PORT` — which
-the flags override. Importing `server.py` never reads `sys.argv`, so it is safe to import
-from tests or an ASGI loader.
+Each flag also has an environment variable — `SSRQ_DB`, `SSRQ_HOST`, `SSRQ_PORT`,
+`SSRQ_HTTP_PATH` — which the flags override. Importing `server.py` never reads
+`sys.argv`, so it is safe to import from tests or an ASGI loader.
+
+`--http-path` (default `/mcp`) is the path the MCP endpoint is served at. **Behind a
+reverse proxy, set it to the public path** — see [Reverse proxy](#reverse-proxy-nginx).
 
 ### 4. Connect a client
 
@@ -100,24 +103,55 @@ docker compose up -d
 The container serves on port 8002 and expects `ssrq.db` at `/data/ssrq.db`. Adjust the
 volume path in `docker-compose.yml` if your data lives elsewhere.
 
-### Reverse proxy (nginx, optional but recommended)
+### Reverse proxy (nginx)
+
+<a id="reverse-proxy-nginx"></a>
+
+Serving under a sub-path (`https://tei.example.ch/mcp/ssrq/mcp`) has exactly one rule:
+**the app's `--http-path` and the nginx `location` must be the same string.** The
+endpoint is one path that answers `POST` (requests), `GET` (the server→client stream),
+and `DELETE` (session teardown); it builds no URLs of its own, so all nginx has to do is
+forward the path unchanged.
 
 ```nginx
 server {
     listen 443 ssl;
-    server_name ssrq-mcp.example.unibe.ch;
+    server_name tei.example.ch;
 
-    location / {
-        proxy_pass         http://localhost:8002;
+    # SSRQ_HTTP_PATH=/mcp/ssrq/mcp — same string, no trailing slash on proxy_pass,
+    # so the path reaches the app unrewritten.
+    location /mcp/ssrq/mcp {
+        proxy_pass         http://127.0.0.1:8002;
         proxy_http_version 1.1;
-        # Required for the streaming responses
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        # The GET stream must not be buffered or timed out mid-session.
         proxy_set_header   Connection '';
         proxy_buffering    off;
         proxy_cache        off;
+        proxy_read_timeout 3600s;
         chunked_transfer_encoding on;
     }
 }
 ```
+
+Two failure modes worth knowing, both of which return a bare `Not Found` or `405`:
+
+- **A trailing slash on `proxy_pass`** (`http://127.0.0.1:8002/`) strips the location
+  prefix, so the app sees `/` and no route matches.
+- **`location` and `--http-path` disagree** — the app 404s every request. Check the
+  startup line, which prints the exact path being served:
+  `Starting SSRQ MCP server on 0.0.0.0:8002/mcp/ssrq/mcp`.
+
+Verify from outside before wiring up a client:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST https://tei.example.ch/mcp/ssrq/mcp -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
+```
+
+`200` means the endpoint is live. `404` is a path mismatch, `405` means nginx is not
+passing `POST` to the app (a static `location` or a `limit_except` is shadowing it).
 
 > **Note:** the server has no authentication. By default `docker-compose.yml` publishes
 > port 8002 on all interfaces; if a proxy fronts it, bind it to loopback instead so the
@@ -151,7 +185,7 @@ server {
 | URI | Description |
 |-----|-------------|
 | `ssrq://stats` | Corpus statistics (JSON) |
-| `ssrq://orgs` | Organisation index — `{total, returned, truncated, orgs: [...]}`, capped at 9999 rows and flagged when truncated |
+| `ssrq://orgs` | Organisation index — `{total, returned, truncated, orgs: [...]}`, capped at 1000 rows and flagged when truncated |
 | `ssrq://person/{pid}` | Single person record (JSON) |
 | `ssrq://org/{oid}` | Single organisation record (JSON) |
 
@@ -160,6 +194,11 @@ server {
 **Limits.** Every `limit` is clamped to at most 500; a negative, zero, or non-numeric
 value falls back to that tool's own default rather than returning the whole table. Use
 `list_persons(limit, offset)` to page through the register.
+
+**Result size.** Claude.ai and Claude Desktop truncate a tool or resource result at
+roughly 150,000 characters. `ssrq://orgs` is capped at 1000 rows (about 100 KB) for that
+reason and reports its own truncation; the 500-row tool ceiling stays comfortably under
+the limit too.
 
 **Name search.** `search_persons`, `search_orgs`, and `search_name_index` do a plain
 case-insensitive substring match. SQL wildcards in the query are escaped, so searching for
