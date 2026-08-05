@@ -1,222 +1,150 @@
-"""server.py — SSRQ MCP server (mcp 2.0, callback-based Server API)."""
-import json
-import logging
-import os
-from typing import Any
-
-from mcp.server import Server
-from mcp.types import (
-    Tool,
-    TextContent,
-    CallToolResult,
-    ListToolsResult,
-)
-
+"""server.py — SSRQ MCP server (mcp 2.0 MCPServer, streamable HTTP)."""
+import argparse, json, logging, os
+from mcp.server.mcpserver import MCPServer
 import db as db_module
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+# Defaults come from the environment so that importing this module never touches
+# sys.argv — argparse at import time would hijack the arguments of any process that
+# imports the server (tests, an ASGI loader). The CLI overrides these in main().
+DEFAULT_DB   = os.environ.get("SSRQ_DB", "/data/ssrq.db")
+DEFAULT_HOST = os.environ.get("SSRQ_HOST", "0.0.0.0")
+DEFAULT_PORT = int(os.environ.get("SSRQ_PORT", "8002"))
+HTTP_PATH    = "/mcp"
 
-# ── Tool registry ─────────────────────────────────────────────────────────────
+MAX_YEAR_SPAN = 500
 
-TOOLS: list[Tool] = [
-    Tool(
-        name="corpus_stats",
-        title="Corpus Statistics",
-        description="High-level row counts for the SSRQ corpus.",
-        input_schema={"type": "object", "properties": {}},
-    ),
-    Tool(
-        name="search_persons",
-        title="Search Persons",
-        description="Search the person authority by name. Returns id, label, std_name, life dates.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Name fragment to search for."},
-                "limit": {"type": "integer", "default": 50, "description": "Max results."},
-            },
-            "required": ["query"],
-        },
-    ),
-    Tool(
-        name="get_person",
-        title="Get Person",
-        description="Full person record by SSRQ id (e.g. per000001).",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "pid": {"type": "string", "description": "SSRQ person id (e.g. per000001)."},
-            },
-            "required": ["pid"],
-        },
-    ),
-    Tool(
-        name="search_orgs",
-        title="Search Organisations",
-        description="Search the organisation authority by name.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Organisation name fragment."},
-                "limit": {"type": "integer", "default": 50, "description": "Max results."},
-            },
-            "required": ["query"],
-        },
-    ),
-    Tool(
-        name="get_org",
-        title="Get Organisation",
-        description="Full organisation record by SSRQ id (e.g. org000001).",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "oid": {"type": "string", "description": "SSRQ org id (e.g. org000001)."},
-            },
-            "required": ["oid"],
-        },
-    ),
-    Tool(
-        name="search_name_index",
-        title="Search Name Index",
-        description="Search all name variants (138k entries) by name fragment. Returns all matching persons and orgs with their canonical label.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Name fragment to search."},
-                "type_filter": {"type": "string", "enum": ["person", "org"], "description": "Restrict to persons or orgs."},
-                "limit": {"type": "integer", "default": 50, "description": "Max results."},
-            },
-            "required": ["query"],
-        },
-    ),
-    Tool(
-        name="get_name_variants",
-        title="Name Variants",
-        description="All name variants on record for a given person or org id.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "id": {"type": "string", "description": "SSRQ person or org id."},
-            },
-            "required": ["id"],
-        },
-    ),
-    Tool(
-        name="related_persons",
-        title="Related Persons",
-        description="Person's related persons, orgs, and places via spouse/family/org membership links.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "pid": {"type": "string", "description": "SSRQ person id."},
-            },
-            "required": ["pid"],
-        },
-    ),
-]
+db_module.set_db_path(DEFAULT_DB)
 
-
-def _call_tool(name: str, arguments: dict[str, Any] | None) -> CallToolResult:
-    """Dispatch to the appropriate dbModule function and wrap the result."""
-    if name == "corpus_stats":
-        data = db_module.stats()
-    elif name == "search_persons":
-        data = db_module.search_persons(arguments["query"], arguments.get("limit", 50))
-    elif name == "get_person":
-        result = db_module.get_person(arguments["pid"])
-        data = result if result else {"error": f"Person '{arguments['pid']}' not found."}
-    elif name == "search_orgs":
-        data = db_module.search_orgs(arguments["query"], arguments.get("limit", 50))
-    elif name == "get_org":
-        result = db_module.get_org(arguments["oid"])
-        data = result if result else {"error": f"Organisation '{arguments['oid']}' not found."}
-    elif name == "search_name_index":
-        data = db_module.search_name_index(
-            arguments["query"],
-            arguments.get("type_filter"),
-            arguments.get("limit", 50),
-        )
-    elif name == "get_name_variants":
-        data = db_module.get_name_variants(arguments["id"])
-    elif name == "related_persons":
-        data = db_module.related_persons(arguments["pid"])
-    else:
-        data = {"error": f"Unknown tool: {name}"}
-
-    return CallToolResult(
-        content=[TextContent(type="text", text=json.dumps(data, indent=2, ensure_ascii=False))]
-    )
-
-
-# ── Server setup ──────────────────────────────────────────────────────────────
-
-INSTRUCTIONS = (
-    "The Swiss Summary of Roman Law (SSRQ) person and organisation authority file. "
-    "Covers legal professionals, institutions, and related entities from Roman law sources. "
-    "Person IDs: perXXXXXX; Organisation IDs: orgXXXXXX. "
-    "Use search_persons/search_orgs for name lookups; "
-    "use get_person/get_org for full records; "
-    "use search_name_index to search all 138k name variants."
+mcp = MCPServer(
+    name="SSRQ",
+    version="1.0.0",
+    instructions=(
+        "The person and organisation authority file of the Sammlung Schweizerischer "
+        "Rechtsquellen (SSRQ · SDS · FDS), the Collection of Swiss Law Sources "
+        "published by the Rechtsquellenstiftung of the Swiss Law Society. "
+        "The editions cover legal-historical documents from the Middle Ages to 1798. "
+        "Persons use SSRQ identifiers (perXXXXXX), organisations orgXXXXXX. "
+        "Use search_persons/search_orgs for name lookups, get_person/get_org for full "
+        "records, search_name_index to reach historical spelling variants, and "
+        "related_persons for family and institutional links."
+    ),
 )
 
+# ── Tools ─────────────────────────────────────────────────────────────────────
 
-def make_server() -> Server:
-    """Build an SSRQ MCP server instance."""
+@mcp.tool()
+def corpus_stats() -> dict:
+    """High-level counts for the SSRQ authority file, plus the attested year range."""
+    return db_module.stats()
 
-    async def list_tools() -> ListToolsResult:
-        return ListToolsResult(tools=TOOLS)
+@mcp.tool()
+def list_persons(limit: int = 50, offset: int = 0) -> list[dict]:
+    """Paginated list of the person authority file, ordered by SSRQ id."""
+    return db_module.list_persons(limit, offset)
 
-    async def call_tool(ctx, params) -> CallToolResult:
-        name = params.name
-        arguments = dict(params.arguments) if params.arguments else {}
-        return _call_tool(name, arguments)
+@mcp.tool()
+def search_persons(query: str, limit: int = 50) -> list[dict]:
+    """Search persons by name — standardised, label, or historical spelling variants."""
+    return db_module.search_persons(query, limit)
 
-    server = Server(
-        name="SSRQ",
-        version="1.0.0",
-        instructions=INSTRUCTIONS,
-        on_list_tools=list_tools,
-        on_call_tool=call_tool,
-    )
+@mcp.tool()
+def get_person(pid: str) -> dict:
+    """Full person record by SSRQ id (e.g. per000001), including its name variants."""
+    result = db_module.get_person(pid)
+    if not result:
+        return {"error": f"Person '{pid}' not found."}
+    return result
 
-    return server
+@mcp.tool()
+def get_persons_by_year(year_from: int, year_to: int, limit: int = 100) -> list[dict]:
+    """Persons whose attested years overlap a given range (inclusive)."""
+    if year_to < year_from:
+        return [{"error": "year_to must be >= year_from"}]
+    if year_to - year_from > MAX_YEAR_SPAN:
+        return [{"error": f"Year range too large; max {MAX_YEAR_SPAN} years."}]
+    return db_module.get_persons_by_year(year_from, year_to, limit)
 
+@mcp.tool()
+def search_orgs(query: str, limit: int = 50) -> list[dict]:
+    """Search the organisation authority file by name."""
+    return db_module.search_orgs(query, limit)
 
-# ── CLI entry point ───────────────────────────────────────────────────────────
+@mcp.tool()
+def get_org(oid: str) -> dict:
+    """Full organisation record by SSRQ id (e.g. org000001), including its name variants."""
+    result = db_module.get_org(oid)
+    if not result:
+        return {"error": f"Organisation '{oid}' not found."}
+    return result
+
+@mcp.tool()
+def search_name_index(query: str, type_filter: str = "", limit: int = 50) -> list[dict]:
+    """Search every recorded name variant. Set type_filter to 'person' or 'org' to
+    restrict; each row reports its own `kind`, the matched `name_text`, and the
+    canonical label of the entity it belongs to."""
+    return db_module.search_name_index(query, type_filter or None, limit)
+
+@mcp.tool()
+def get_name_variants(id: str) -> list[dict]:
+    """All name variants on record for a given person or organisation id."""
+    return db_module.get_name_variants(id)
+
+@mcp.tool()
+def related_persons(pid: str) -> dict:
+    """A person's spouses, parents, organisations, and places, resolved to records."""
+    return db_module.related_persons(pid)
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+
+@mcp.resource("ssrq://stats")
+def resource_stats() -> str:
+    return json.dumps(db_module.stats(), indent=2)
+
+@mcp.resource("ssrq://orgs")
+def resource_orgs() -> str:
+    """Brief organisation index: id, label, std_name, type. Flags its own truncation."""
+    return json.dumps(db_module.org_index(), indent=2, ensure_ascii=False)
+
+@mcp.resource("ssrq://person/{pid}")
+def resource_person(pid: str) -> str:
+    result = db_module.get_person(pid)
+    if not result:
+        return json.dumps({"error": f"Person '{pid}' not found."})
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+@mcp.resource("ssrq://org/{oid}")
+def resource_org(oid: str) -> str:
+    result = db_module.get_org(oid)
+    if not result:
+        return json.dumps({"error": f"Organisation '{oid}' not found."})
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def parse_args(argv=None):
-    import argparse
     ap = argparse.ArgumentParser(description="SSRQ MCP server")
-    ap.add_argument("--db",   default=os.environ.get("SSRQ_DB",   "/data/ssrq.db"))
-    ap.add_argument("--host", default=os.environ.get("SSRQ_HOST", "0.0.0.0"))
-    ap.add_argument("--port", type=int, default=int(os.environ.get("SSRQ_PORT", "8002")))
+    ap.add_argument("--db",   default=DEFAULT_DB,   help="Path to ssrq.db (env SSRQ_DB)")
+    ap.add_argument("--host", default=DEFAULT_HOST, help="Bind address (env SSRQ_HOST)")
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port (env SSRQ_PORT)")
     return ap.parse_args(argv)
 
-
-if __name__ == "__main__":
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
     db_module.set_db_path(args.db)
 
     logger.info(f"Database: {args.db}")
     try:
         s = db_module.stats()
-        logger.info(
-            f"Corpus: {s['persons']:,} persons, {s['orgs']:,} orgs, "
-            f"{s['name_index']:,} name variants"
-        )
+        logger.info(f"Corpus: {s['n_persons']:,} persons, {s['n_orgs']:,} orgs, "
+                    f"{s['n_name_index']:,} name variants")
     except Exception as e:
         logger.warning(f"Could not read DB stats: {e}")
+    logger.info(f"Starting SSRQ MCP server on {args.host}:{args.port}{HTTP_PATH}")
+    mcp.run(transport="streamable-http", host=args.host, port=args.port,
+            streamable_http_path=HTTP_PATH)
 
-    server = make_server()
-
-    app = server.streamable_http_app(
-        streamable_http_path="/mcp",
-        host=args.host,
-        json_response=False,
-    )
-
-    import uvicorn
-    logger.info(f"Starting SSRQ MCP server on {args.host}:{args.port}")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+if __name__ == "__main__":
+    main()

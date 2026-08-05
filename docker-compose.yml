@@ -5,13 +5,18 @@ services:
     container_name: ssrq-mcp
     restart: unless-stopped
     ports:
-      - "8002:8002"
+      # Published on all interfaces by default. The server has no authentication, so
+      # if nginx (or another proxy) fronts it, set SSRQ_BIND=127.0.0.1 to make it
+      # unreachable directly from the network.
+      - "${SSRQ_BIND:-0.0.0.0}:8002:8002"
     volumes:
       - /home/dh/Repos/ssrq_project/data:/data
     environment:
       - PYTHONUNBUFFERED=1
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/mcp')"]
+      # A plain TCP connect: opening /mcp would start an MCP session and abandon it
+      # every 30 seconds.
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 8002), 3).close()"]
       interval: 30s
       timeout: 10s
       retries: 3
