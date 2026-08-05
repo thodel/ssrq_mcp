@@ -1,0 +1,18 @@
+services:
+  ssrq-mcp:
+    build: .
+    image: ssrq-mcp:latest
+    container_name: ssrq-mcp
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    volumes:
+      - /home/dh/Repos/ssrq_project/data:/data
+    environment:
+      - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/mcp')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
