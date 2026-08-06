@@ -12,7 +12,21 @@ logger = logging.getLogger(__name__)
 DEFAULT_DB   = os.environ.get("SSRQ_DB", "/data/ssrq.db")
 DEFAULT_HOST = os.environ.get("SSRQ_HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.environ.get("SSRQ_PORT", "8002"))
-HTTP_PATH    = "/mcp"
+
+
+def normalise_path(path):
+    """A single leading slash, no trailing slash — the form the ASGI route wants.
+
+    Behind a reverse proxy the server must answer on its *public* path: the
+    streamable-HTTP transport builds no URLs of its own, but the route only
+    matches what it was mounted at. Setting this to the public path (e.g.
+    /mcp/ssrq/mcp) lets nginx proxy_pass without rewriting, which is the mismatch
+    that makes a sub-path deployment 404."""
+    cleaned = (path or "").strip().strip("/")
+    return f"/{cleaned}" if cleaned else "/mcp"
+
+
+DEFAULT_HTTP_PATH = normalise_path(os.environ.get("SSRQ_HTTP_PATH", "/mcp"))
 
 MAX_YEAR_SPAN = 500
 
@@ -129,7 +143,12 @@ def parse_args(argv=None):
     ap.add_argument("--db",   default=DEFAULT_DB,   help="Path to ssrq.db (env SSRQ_DB)")
     ap.add_argument("--host", default=DEFAULT_HOST, help="Bind address (env SSRQ_HOST)")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port (env SSRQ_PORT)")
-    return ap.parse_args(argv)
+    ap.add_argument("--http-path", default=DEFAULT_HTTP_PATH,
+                    help="Path the MCP endpoint is served at; set it to the public "
+                         "path when behind a reverse proxy (env SSRQ_HTTP_PATH)")
+    args = ap.parse_args(argv)
+    args.http_path = normalise_path(args.http_path)
+    return args
 
 def main(argv=None):
     args = parse_args(argv)
@@ -142,9 +161,9 @@ def main(argv=None):
                     f"{s['n_name_index']:,} name variants")
     except Exception as e:
         logger.warning(f"Could not read DB stats: {e}")
-    logger.info(f"Starting SSRQ MCP server on {args.host}:{args.port}{HTTP_PATH}")
+    logger.info(f"Starting SSRQ MCP server on {args.host}:{args.port}{args.http_path}")
     mcp.run(transport="streamable-http", host=args.host, port=args.port,
-            streamable_http_path=HTTP_PATH)
+            streamable_http_path=args.http_path)
 
 if __name__ == "__main__":
     main()
