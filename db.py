@@ -32,6 +32,37 @@ CREATE TABLE IF NOT EXISTS name_index (
 );
 CREATE INDEX IF NOT EXISTS idx_name_index_text ON name_index(name_text);
 CREATE INDEX IF NOT EXISTS idx_name_index_id   ON name_index(ssrq_id);
+
+-- Edited law sources from SSRQ-SDS-FDS/editio-data (CC BY-NC-SA 4.0).
+--
+-- Until now this server held an authority file and nothing else: it could say
+-- who a name referred to, never what a document said. These are the documents —
+-- transcribed charters, statutes and ordinances, 1050 to 1846 — which makes
+-- SSRQ a source of evidence rather than only of entity context.
+--
+-- origin_from/origin_to come from <origDate>, which is the date the document
+-- was issued. The TEI also carries <date type="electronic">, the date the
+-- edition was published; conflating the two would date a fifteenth-century
+-- charter to 2022.
+CREATE TABLE IF NOT EXISTS documents (
+  id TEXT PRIMARY KEY,          -- the TEI <idno>, e.g. SSRQ-ZH-NF_I_1_3-1-1
+  canton TEXT,                  -- FR, NE, SG, VD, ZH
+  volume TEXT,                  -- the edition volume directory
+  title TEXT,
+  lang TEXT,
+  origin_from INTEGER,          -- year the document was issued
+  origin_to INTEGER,            -- end of the range, where dated as a span
+  place TEXT,
+  text TEXT,                    -- the transcription, tags stripped
+  n_chars INTEGER,
+  url TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_documents_year   ON documents(origin_from);
+CREATE INDEX IF NOT EXISTS idx_documents_canton ON documents(canton);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+  title, text, content='documents', content_rowid='rowid'
+);
 """
 
 
