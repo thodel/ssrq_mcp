@@ -675,3 +675,26 @@ def test_every_module_is_copied_into_the_image():
         and p.name not in {"ingest_editio.py", "embed_db.py", "conftest.py"}
     }
     assert not shipped - copied, f"not COPYed into the image: {sorted(shipped - copied)}"
+
+
+def test_the_semantic_layer_has_every_name_it_uses():
+    """The vector cache was left behind when these functions were brought over
+    from kf_mcp, and nothing noticed until a query hit the server:
+    NameError inside a tool surfaces to the caller as a bare
+    "Error executing tool search_semantic".
+    """
+    import ast
+    import pathlib
+
+    tree = ast.parse((pathlib.Path(__file__).resolve().parent / "db.py")
+                     .read_text(encoding="utf-8"))
+    loaded = {n.id for n in ast.walk(tree)
+              if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+    assigned = {t.id for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                for t in n.targets if isinstance(t, ast.Name)}
+    assigned |= {n.target.id for n in ast.walk(tree)
+                 if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name)}
+
+    missing = sorted(n for n in loaded
+                     if n.startswith("_") and n.isupper() and n not in assigned)
+    assert not missing, f"module-level names used but never defined: {missing}"
