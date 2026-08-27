@@ -292,7 +292,7 @@ def semantic_stats(model=None):
 # bare "Error executing tool search_semantic".
 _SEMANTIC_SQL = (
     "SELECT c.chunk_id,c.doc_id,c.chunk_index,c.char_start,c.char_end,c.text,"
-    "e.title,e.canton,e.volume,e.origin_from,e.origin_to,e.lang,e.place,e.url "
+    "e.title,e.canton,e.volume,e.origin_from AS year,e.origin_to,e.lang,e.place,e.url "
     "FROM chunks c JOIN documents e ON e.id=c.doc_id "
     "WHERE c.chunk_id IN ({placeholders})"
 )
