@@ -43,7 +43,14 @@ mcp = MCPServer(
         "Persons use SSRQ identifiers (perXXXXXX), organisations orgXXXXXX. "
         "Use search_persons/search_orgs for name lookups, get_person/get_org for full "
         "records, search_name_index to reach historical spelling variants, and "
-        "related_persons for family and institutional links."
+        "related_persons for family and institutional links.\n\n"
+        "The editions themselves are served as well: 4,624 transcribed "
+        "documents from SSRQ-SDS-FDS/editio-data (CC BY-NC-SA 4.0), 1050-1846, "
+        "across Fribourg, Neuchâtel, St Gallen, Vaud and Zurich. Use "
+        "search_semantic for a question in modern language — the transcriptions "
+        "keep the scribe's orthography, so keyword search reaches them only if "
+        "you already know the spelling — search_documents when you do, and "
+        "get_document for the full text."
     ),
 )
 
@@ -53,6 +60,66 @@ mcp = MCPServer(
 def corpus_stats() -> dict:
     """High-level counts for the SSRQ authority file, plus the attested year range."""
     return db_module.stats()
+
+# ── The editions ──────────────────────────────────────────────────────────────
+#
+# Until these were added this server held an authority file and nothing else: it
+# could say who a name referred to, never what a document said. These tools make
+# SSRQ a source of evidence, which is a different claim and a heavier one.
+
+@mcp.tool()
+def search_documents(query: str, limit: int = 20) -> list[dict]:
+    """Keyword search across the edited law sources, 1050–1846.
+
+    Use when the spelling is known — a signature, a place name, a legal
+    formula. For a question in modern German or French, search_semantic reaches
+    this material and this does not: the orthography is the scribe's, not
+    today's.
+    """
+    return db_module.search_documents(query, limit)
+
+
+@mcp.tool()
+def get_document(doc_id: str, with_text: bool = True) -> dict:
+    """One edited document by its TEI identifier (e.g. SSRQ-ZH-NF_I_1_3-19-1)."""
+    result = db_module.get_document(doc_id, with_text=with_text)
+    if not result:
+        return {"error": f"No document {doc_id!r}."}
+    return result
+
+
+@mcp.tool()
+def search_semantic(query: str, limit: int = 20, year_from: int = 0,
+                    year_to: int = 0, per_document: int = 2) -> list[dict]:
+    """Passages from the editions that answer a question, matched by meaning.
+
+    The reason this server embeds its own corpus: a question asked in modern
+    German shares almost no surface forms with a fifteenth-century ordinance,
+    so keyword search reaches it only if the caller already knows how the
+    scribe spelled it.
+
+    `year_from`/`year_to` restrict to a period, which for legal sources is
+    often the point of the question. `per_document` caps how many passages one
+    document may contribute, so a long ordinance cannot crowd out the rest.
+    """
+    import embeddings as emb
+
+    vector = emb.embed_query(query)
+    return db_module.search_semantic(
+        vector, limit=limit,
+        year_from=year_from or None, year_to=year_to or None,
+        per_document=per_document)
+
+
+@mcp.tool()
+def semantic_index_stats() -> dict:
+    """Whether the semantic index is built, and over how much of the corpus.
+
+    Worth checking before trusting an empty result: coverage below 1.0 means
+    passages are missing, not that the corpus has nothing to say.
+    """
+    return db_module.semantic_stats()
+
 
 @mcp.tool()
 def list_persons(limit: int = 50, offset: int = 0) -> list[dict]:
