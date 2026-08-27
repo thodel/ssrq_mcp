@@ -536,3 +536,113 @@ if __name__ == "__main__":
     print(f"\n{'═'*50}")
     print(f"{GREEN}ALL PASSED{RESET}" if ok_all else f"{RED}FAILURES{RESET}")
     sys.exit(0 if ok_all else 1)
+
+
+# ── The editions ──────────────────────────────────────────────────────────────
+# Until these were added the server held an authority file and nothing else. The
+# tests below are about the parts the TEI does not hand over: the document's own
+# title, the date it was issued rather than the date it was published, and a
+# language nobody declared.
+
+import ingest_editio  # noqa: E402
+
+
+TEI = """<?xml version="1.0" encoding="UTF-8"?>
+<TEI xml:lang="de">
+ <teiHeader>
+  <fileDesc><titleStmt>
+    <title>IX. Abteilung: Die Rechtsquellen des Kantons Freiburg</title>
+  </titleStmt></fileDesc>
+  <publicationStmt><idno type="ssrq">SSRQ-ZH-TEST-1-1</idno>
+    <date type="electronic" when="2022-06-28"/></publicationStmt>
+ </teiHeader>
+ <text><body>
+  <head xml:lang="de">Ordnung betreffend die Witwen</head>
+  <origDate from="1446-01-19" to="1468-01-09"/>
+  <p>Wir, der burgermeister und die raͤt der statt Zu̍rich, haben unns
+     vereinbart und bekenndt, das die froͧwen nach unnser statt recht
+     ußgericht werden soͤllen und nicht anders.</p>
+ </body></text>
+</TEI>"""
+
+
+def _write(tmp_path, xml=TEI, name="SSRQ-ZH-TEST-1-1.xml"):
+    volume = tmp_path / "data" / "ZH" / "ZH_TEST"
+    volume.mkdir(parents=True, exist_ok=True)
+    (volume / name).write_text(xml, encoding="utf-8")
+    return tmp_path
+
+
+def test_the_document_title_is_the_head_not_the_series(tmp_path):
+    """<title> is the series — the same string for every file in a volume, so
+    it identifies nothing in a footnote. The document's own title is <head>."""
+    root = _write(tmp_path)
+    row = ingest_editio.parse(
+        root / "data/ZH/ZH_TEST/SSRQ-ZH-TEST-1-1.xml", root)
+
+    assert row["title"] == "Ordnung betreffend die Witwen"
+    assert "IX. Abteilung" not in row["title"]
+
+
+def test_the_date_is_when_the_document_was_issued(tmp_path):
+    """The same file carries <date type="electronic" when="2022-06-28"/>, the
+    date the edition was published. Reading that dates a 1446 charter to 2022."""
+    root = _write(tmp_path)
+    row = ingest_editio.parse(
+        root / "data/ZH/ZH_TEST/SSRQ-ZH-TEST-1-1.xml", root)
+
+    assert row["origin_from"] == 1446
+    assert row["origin_to"] == 1468
+
+
+def test_the_canton_and_volume_come_from_the_path(tmp_path):
+    root = _write(tmp_path)
+    row = ingest_editio.parse(
+        root / "data/ZH/ZH_TEST/SSRQ-ZH-TEST-1-1.xml", root)
+
+    assert (row["canton"], row["volume"]) == ("ZH", "ZH_TEST")
+
+
+def test_language_is_detected_not_read_from_the_header(tmp_path):
+    """xml:lang on <TEI> is the language of the edition's metadata. Every
+    Fribourg file says "de" whether the charter is German or French."""
+    root = _write(tmp_path)
+    row = ingest_editio.parse(
+        root / "data/ZH/ZH_TEST/SSRQ-ZH-TEST-1-1.xml", root)
+    assert row["lang"] == "de"
+
+    french = TEI.replace(
+        "<p>Wir, der burgermeister und die raͤt der statt Zu̍rich, haben unns\n"
+        "     vereinbart und bekenndt, das die froͧwen nach unnser statt recht\n"
+        "     ußgericht werden soͤllen und nicht anders.</p>",
+        "<p>Nous, le conseil de la ville, qui avons ordonne que les veuves "
+        "des bourgeois et les femmes qui sont dans la seigneurie pour le "
+        "droit des enfants et pour la dot.</p>")
+    root2 = _write(tmp_path / "fr", french)
+    row2 = ingest_editio.parse(
+        root2 / "data/ZH/ZH_TEST/SSRQ-ZH-TEST-1-1.xml", root2)
+
+    assert row2["lang"] == "fr", "the header would have said 'de'"
+
+
+def test_an_unclear_language_is_left_empty(tmp_path):
+    """Roughly eight hundred transcriptions are Latin under a German editorial
+    apparatus. A wrong tag drops them from a language filter in silence, so
+    nothing is claimed."""
+    root = _write(tmp_path, TEI.replace(
+        "<p>Wir, der burgermeister und die raͤt der statt Zu̍rich, haben unns\n"
+        "     vereinbart und bekenndt, das die froͧwen nach unnser statt recht\n"
+        "     ußgericht werden soͤllen und nicht anders.</p>",
+        "<p>Item.</p>"))
+    row = ingest_editio.parse(
+        root / "data/ZH/ZH_TEST/SSRQ-ZH-TEST-1-1.xml", root)
+
+    assert row["lang"] == ""
+
+
+def test_a_file_without_a_transcription_is_skipped(tmp_path):
+    """Of 5,596 files, 968 are indices and front matter."""
+    root = _write(tmp_path, TEI.replace("<text><body>", "<text><front>")
+                                .replace("</body></text>", "</front></text>"))
+    assert ingest_editio.parse(
+        root / "data/ZH/ZH_TEST/SSRQ-ZH-TEST-1-1.xml", root) is None

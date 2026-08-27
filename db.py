@@ -1,4 +1,6 @@
 """db.py — read-only SQLite helpers for the SSRQ MCP server."""
+import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from typing import Any, Optional
@@ -32,7 +34,267 @@ CREATE TABLE IF NOT EXISTS name_index (
 );
 CREATE INDEX IF NOT EXISTS idx_name_index_text ON name_index(name_text);
 CREATE INDEX IF NOT EXISTS idx_name_index_id   ON name_index(ssrq_id);
+
+-- Edited law sources from SSRQ-SDS-FDS/editio-data (CC BY-NC-SA 4.0).
+--
+-- Until now this server held an authority file and nothing else: it could say
+-- who a name referred to, never what a document said. These are the documents —
+-- transcribed charters, statutes and ordinances, 1050 to 1846 — which makes
+-- SSRQ a source of evidence rather than only of entity context.
+--
+-- origin_from/origin_to come from <origDate>, which is the date the document
+-- was issued. The TEI also carries <date type="electronic">, the date the
+-- edition was published; conflating the two would date a fifteenth-century
+-- charter to 2022.
+CREATE TABLE IF NOT EXISTS documents (
+  id TEXT PRIMARY KEY,          -- the TEI <idno>, e.g. SSRQ-ZH-NF_I_1_3-1-1
+  canton TEXT,                  -- FR, NE, SG, VD, ZH
+  volume TEXT,                  -- the edition volume directory
+  title TEXT,
+  lang TEXT,
+  origin_from INTEGER,          -- year the document was issued
+  origin_to INTEGER,            -- end of the range, where dated as a span
+  place TEXT,
+  text TEXT,                    -- the transcription, tags stripped
+  n_chars INTEGER,
+  url TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_documents_year   ON documents(origin_from);
+CREATE INDEX IF NOT EXISTS idx_documents_canton ON documents(canton);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+  title, text, content='documents', content_rowid='rowid'
+);
 """
+
+
+# Chunk and vector tables, mirroring kf_mcp. Kept separate from SCHEMA_SQL so
+# a database built before the editions were ingested can be upgraded in place
+# rather than rebuilt.
+EMBEDDING_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS chunks (
+    chunk_id    TEXT    PRIMARY KEY,   -- "<doc_id>#<chunk_index>"
+    doc_id    TEXT    NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    char_start  INTEGER NOT NULL,
+    char_end    INTEGER NOT NULL,
+    text        TEXT    NOT NULL,      -- the transcription as edited, tags stripped
+    UNIQUE (doc_id, chunk_index)
+);
+CREATE TABLE IF NOT EXISTS embeddings (
+    chunk_id TEXT    PRIMARY KEY REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+    model    TEXT    NOT NULL,
+    dims     INTEGER NOT NULL,
+    vector   BLOB    NOT NULL          -- float32, little-endian, L2-normalised
+);
+CREATE TABLE IF NOT EXISTS embedding_runs (
+    run_id      TEXT PRIMARY KEY,
+    started_at  TEXT NOT NULL,
+    finished_at TEXT,
+    model       TEXT NOT NULL,
+    dims        INTEGER,
+    base_url    TEXT,
+    chunk_chars INTEGER,
+    chunk_overlap INTEGER,
+    n_articles  INTEGER,
+    n_chunks    INTEGER,
+    notes       TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_chunks_entry ON chunks(doc_id);
+CREATE INDEX IF NOT EXISTS ix_embeddings_model ON embeddings(model);
+"""
+
+
+# ── Editions: full text and meaning ──────────────────────────────────────────
+
+_DOC_FTS_SQL = (
+    "SELECT d.id, d.title, d.canton, d.volume, d.origin_from, d.origin_to, "
+    "d.lang, d.place, d.url, "
+    "snippet(documents_fts, 1, '<mark>', '</mark>', '…', 32) AS snippet "
+    "FROM documents_fts JOIN documents d ON documents_fts.rowid = d.rowid "
+    "WHERE documents_fts MATCH ? ORDER BY rank LIMIT ?"
+)
+
+
+def quote_fts(query):
+    """Rewrite a query as quoted FTS5 phrases, one per word (implicit AND).
+    Strips the characters FTS5 treats as syntax so no input can be a syntax error."""
+    tokens = [t for t in re.split(r'\s+', re.sub(r'["\*\(\):^-]', ' ', query)) if t]
+    return ' '.join(f'"{t}"' for t in tokens)
+
+def search_documents(query, limit=20):
+    """Keyword search over the transcriptions.
+
+    Useful when the caller already knows the spelling — a signature, a place
+    name, a formula. For a question in modern German, search_semantic reaches
+    this material and this does not: the orthography is the scribe's.
+    """
+    limit = clamp(limit, 20)
+    if not query or not query.strip():
+        return [{"error": "Empty query."}]
+    with conn() as c:
+        for q in (query, quote_fts(query)):
+            if not q:
+                break
+            try:
+                return r(c.execute(_DOC_FTS_SQL, (q, limit)).fetchall())
+            except sqlite3.OperationalError:
+                continue
+    return [{"error": f"Could not parse query: {query!r}"}]
+
+
+def get_document(doc_id, with_text=True):
+    """One edited document, by its TEI idno."""
+    cols = ("id, canton, volume, title, lang, origin_from, origin_to, place, "
+            "n_chars, url" + (", text" if with_text else ""))
+    with conn() as c:
+        row = c.execute(f"SELECT {cols} FROM documents WHERE id = ?", (doc_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def _load_matrix(model):
+    """(chunk_ids, matrix) for a model, loaded once and cached."""
+    key = (_DB_PATH, model)
+    cached = _VECTOR_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError(
+            "numpy is required for semantic search — pip install numpy") from exc
+    with conn() as c:
+        rows = c.execute(
+            "SELECT chunk_id, dims, vector FROM embeddings WHERE model = ? "
+            "ORDER BY chunk_id", (model,)).fetchall()
+    if not rows:
+        raise RuntimeError(
+            f"no embeddings for model {model!r} in {_DB_PATH}. "
+            "Run embed_db.py to build the semantic index.")
+    dims = rows[0]["dims"]
+    chunk_ids = [row["chunk_id"] for row in rows]
+    # One contiguous buffer: the difference between a matrix multiply and
+    # thousands of small ones.
+    buffer = b"".join(row["vector"] for row in rows)
+    matrix = np.frombuffer(buffer, dtype="<f4").reshape(len(rows), dims)
+    _VECTOR_CACHE[key] = (chunk_ids, matrix)
+    return chunk_ids, matrix
+
+
+def search_semantic(query_vector, limit=20, model=None, year_from=None,
+                    year_to=None, per_document=2):
+    """Passages closest in meaning to an already-embedded query.
+
+    ``per_document`` caps how many passages one document may contribute, so a long
+    document cannot fill the result set and crowd out the other documents that
+    answer the question. ``year_from``/``year_to`` restrict to a period, which
+    for this corpus is often the point of the question.
+    """
+    import numpy as np
+
+    limit = clamp(limit, 20)
+    model = model or os.environ.get("SSRQ_EMBED_MODEL", "qwen3-embedding-0.6b")
+    chunk_ids, matrix = _load_matrix(model)
+
+    query = np.asarray(query_vector, dtype="float32")
+    if query.shape[0] != matrix.shape[1]:
+        raise ValueError(
+            f"query has {query.shape[0]} dimensions, index has {matrix.shape[1]}")
+    norm = float(np.linalg.norm(query)) or 1.0
+    scores = matrix @ (query / norm)
+
+    # Take a generous slice before filtering: the year filter and the per-entry
+    # cap both discard candidates.
+    fetch = min(len(chunk_ids), max(limit * 8, limit + 50))
+    candidates = np.argpartition(-scores, fetch - 1)[:fetch]
+    candidates = candidates[np.argsort(-scores[candidates])]
+    picked = [(chunk_ids[i], float(scores[i])) for i in candidates]
+
+    by_id = {}
+    with conn() as c:
+        for start in range(0, len(picked), 400):
+            window = picked[start:start + 400]
+            sql = _SEMANTIC_SQL.format(placeholders=",".join("?" * len(window)))
+            for row in c.execute(sql, [cid for cid, _ in window]).fetchall():
+                by_id[row["chunk_id"]] = row
+
+    out, seen = [], {}
+    for chunk_id, score in picked:
+        row = by_id.get(chunk_id)
+        if row is None:
+            continue                      # vector outlived its chunk
+        year = row["year"]
+        if year_from is not None and (year is None or year < year_from):
+            continue
+        if year_to is not None and (year is None or year > year_to):
+            continue
+        if seen.get(row["doc_id"], 0) >= per_document:
+            continue
+        seen[row["doc_id"]] = seen.get(row["doc_id"], 0) + 1
+        out.append({
+            "id": row["doc_id"],
+            "chunk_id": chunk_id,
+            "title": row["title"],
+            "short_id": row["short_id"],
+            "year": year,
+            "source": row["source"],
+            "snippet": row["text"],
+            "score": round(score, 4),
+            "chunk_index": row["chunk_index"],
+            "char_start": row["char_start"],
+            "char_end": row["char_end"],
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+def semantic_stats(model=None):
+    """Coverage of the semantic index, and the runs that produced it."""
+    with conn() as c:
+        if not c.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                         "AND name='embeddings'").fetchone():
+            return {"indexed": False,
+                    "reason": "no embeddings table; run embed_db.py"}
+        by_model = c.execute(
+            "SELECT model, COUNT(*) n, MAX(dims) d FROM embeddings GROUP BY model"
+        ).fetchall()
+        n_chunks = c.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        n_total = c.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+        n_indexed = c.execute(
+            "SELECT COUNT(DISTINCT doc_id) FROM chunks").fetchone()[0]
+        runs = c.execute(
+            "SELECT run_id, started_at, finished_at, model, dims, n_chunks, notes "
+            "FROM embedding_runs ORDER BY started_at DESC LIMIT 5").fetchall()
+    return {
+        "indexed": bool(by_model),
+        "n_chunks": n_chunks,
+        "n_entries_indexed": n_indexed,
+        "n_entries_total": n_total,
+        "coverage": round(n_indexed / n_total, 4) if n_total else 0.0,
+        "models": [{"model": m["model"], "n_vectors": m["n"], "dims": m["d"]}
+                   for m in by_model],
+        "recent_runs": r(runs),
+    }
+
+
+_SEMANTIC_SQL = (
+    "SELECT c.chunk_id,c.doc_id,c.chunk_index,c.char_start,c.char_end,c.text,"
+    "e.title,e.short_id,e.origin_from,e.source "
+    "FROM chunks c JOIN documents e ON e.id=c.doc_id "
+    "WHERE c.chunk_id IN ({placeholders})"
+)
+
+
+def warm_semantic_index(model):
+    """Load the vectors now and report what was loaded, or why it could not be."""
+    try:
+        chunk_ids, matrix = _load_matrix(model)
+    except RuntimeError as exc:
+        return {"ready": False, "model": model, "reason": str(exc)}
+    return {"ready": True, "model": model, "n_chunks": len(chunk_ids),
+            "dims": int(matrix.shape[1]),
+            "megabytes": round(matrix.nbytes / 1_048_576, 1)}
+
 
 
 def set_db_path(path: str) -> None:
