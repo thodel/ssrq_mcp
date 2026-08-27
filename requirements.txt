@@ -1,3 +1,9 @@
 # mcp 2.0 renamed the high-level server class (FastMCP → MCPServer) and dropped
 # mcp.server.fastmcp, so the major version is pinned deliberately.
 mcp>=2.0.0,<3
+
+# The semantic index: vectors are fetched through the OpenAI-compatible
+# GPUStack API and compared as a brute-force dot product over a numpy
+# array — 18,407 chunks needs no index.
+numpy
+openai

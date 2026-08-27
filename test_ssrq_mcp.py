@@ -646,3 +646,32 @@ def test_a_file_without_a_transcription_is_skipped(tmp_path):
                                 .replace("</body></text>", "</front></text>"))
     assert ingest_editio.parse(
         root / "data/ZH/ZH_TEST/SSRQ-ZH-TEST-1-1.xml", root) is None
+
+
+def test_every_module_is_copied_into_the_image():
+    """The Dockerfile lists modules individually rather than `COPY . .`.
+
+    A new module is then easy to add to the repository and forget here, and
+    nothing fails until the container starts: it builds cleanly, then
+    crash-loops on ModuleNotFoundError. That is how hls_mcp shipped without
+    embeddings.py and took the largest provider in the federation offline.
+    """
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parent
+    # COPY lines only. Scanning the whole file would match module names in
+    # comments — including the one above the COPY line, which made an earlier
+    # version of this test pass with embeddings.py removed.
+    copy_lines = [
+        line for line in (root / "Dockerfile").read_text(encoding="utf-8").splitlines()
+        if line.strip().startswith("COPY")
+    ]
+    copied = set(re.findall(r"([\w]+\.py)", " ".join(copy_lines)))
+    shipped = {
+        p.name for p in root.glob("*.py")
+        if not p.name.startswith("test_")
+        # Pipeline scripts run on the host, not in the serving image.
+        and p.name not in {"ingest_editio.py", "embed_db.py", "conftest.py"}
+    }
+    assert not shipped - copied, f"not COPYed into the image: {sorted(shipped - copied)}"
