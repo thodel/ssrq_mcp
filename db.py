@@ -240,9 +240,13 @@ def search_semantic(query_vector, limit=20, model=None, year_from=None,
             "id": row["doc_id"],
             "chunk_id": chunk_id,
             "title": row["title"],
-            "short_id": row["short_id"],
+            "canton": row["canton"],
+            "volume": row["volume"],
             "year": year,
-            "source": row["source"],
+            "year_to": row["origin_to"],
+            "lang": row["lang"],
+            "place": row["place"],
+            "url": row["url"],
             "snippet": row["text"],
             "score": round(score, 4),
             "chunk_index": row["chunk_index"],
@@ -282,9 +286,13 @@ def semantic_stats(model=None):
     }
 
 
+# The columns are this corpus's, not Königsfelden's: short_id and source came
+# across with the copied machinery and do not exist here. A missing column is
+# not caught until a query runs, and inside a tool it reaches the caller as a
+# bare "Error executing tool search_semantic".
 _SEMANTIC_SQL = (
     "SELECT c.chunk_id,c.doc_id,c.chunk_index,c.char_start,c.char_end,c.text,"
-    "e.title,e.short_id,e.origin_from,e.source "
+    "e.title,e.canton,e.volume,e.origin_from,e.origin_to,e.lang,e.place,e.url "
     "FROM chunks c JOIN documents e ON e.id=c.doc_id "
     "WHERE c.chunk_id IN ({placeholders})"
 )
