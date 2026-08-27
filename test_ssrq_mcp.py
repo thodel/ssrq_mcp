@@ -722,3 +722,54 @@ def test_every_sql_statement_matches_the_schema(tmp_path):
     conn.execute(db._SEMANTIC_SQL.format(placeholders="?"), ("x",)).fetchall()
     conn.execute(db._DOC_FTS_SQL, ("wort", 1)).fetchall()
     conn.close()
+
+
+def test_search_semantic_end_to_end(tmp_path):
+    """Exercises the whole path, which the SQL-only test did not.
+
+    Four separate failures reached the deployed server before this existed —
+    a missing module in the image, a missing vector cache, Königsfelden's
+    columns in the query, and a row key that did not match the alias. Each
+    surfaced to the caller as the same opaque "Error executing tool
+    search_semantic". Running the function over a real database with real
+    vectors catches all four classes at once.
+    """
+    import sqlite3
+    import struct
+
+    import db
+
+    path = tmp_path / "semantic.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(db.SCHEMA_SQL)
+    conn.executescript(db.EMBEDDING_SCHEMA_SQL)
+    conn.execute(
+        "INSERT INTO documents (id, canton, volume, title, lang, origin_from, "
+        "origin_to, place, text, n_chars, url) VALUES "
+        "('SSRQ-ZH-T-1-1','ZH','ZH_T','Ordnung betreffend die Witwen','de',"
+        "1446,1468,'Zürich','Wie froͧwen ußgericht werden soͤllen.',36,'http://x')")
+    conn.execute(
+        "INSERT INTO chunks (chunk_id, doc_id, chunk_index, char_start, char_end, text) "
+        "VALUES ('SSRQ-ZH-T-1-1#0','SSRQ-ZH-T-1-1',0,0,36,"
+        "'Wie froͧwen ußgericht werden soͤllen.')")
+    # A unit vector, so the dot product is defined and the result deterministic.
+    dims = 8
+    vector = [1.0] + [0.0] * (dims - 1)
+    conn.execute(
+        "INSERT INTO embeddings (chunk_id, model, dims, vector) VALUES (?,?,?,?)",
+        ("SSRQ-ZH-T-1-1#0", "test-model", dims,
+         struct.pack(f"<{dims}f", *vector)))
+    conn.commit(); conn.close()
+
+    db.set_db_path(str(path))
+    db._VECTOR_CACHE.clear()
+    hits = db.search_semantic(vector, limit=5, model="test-model")
+
+    assert len(hits) == 1
+    hit = hits[0]
+    assert hit["id"] == "SSRQ-ZH-T-1-1"
+    # The year is the date of issue, aliased from origin_from.
+    assert hit["year"] == 1446
+    assert hit["canton"] == "ZH"
+    assert hit["url"] == "http://x"
+    assert hit["score"] > 0.99
