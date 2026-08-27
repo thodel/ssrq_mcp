@@ -698,3 +698,27 @@ def test_the_semantic_layer_has_every_name_it_uses():
     missing = sorted(n for n in loaded
                      if n.startswith("_") and n.isupper() and n not in assigned)
     assert not missing, f"module-level names used but never defined: {missing}"
+
+
+def test_every_sql_statement_matches_the_schema(tmp_path):
+    """The semantic SQL still asked for Königsfelden's columns.
+
+    short_id and source came across with the copied machinery and do not exist
+    in this corpus. SQLite only complains when the statement runs, and inside
+    an MCP tool that reaches the caller as a bare "Error executing tool
+    search_semantic" — the cause stays in the container log.
+
+    Executing each statement against an empty schema catches it at test time.
+    """
+    import sqlite3
+
+    import db
+
+    path = tmp_path / "schema.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(db.SCHEMA_SQL)
+    conn.executescript(db.EMBEDDING_SCHEMA_SQL)
+
+    conn.execute(db._SEMANTIC_SQL.format(placeholders="?"), ("x",)).fetchall()
+    conn.execute(db._DOC_FTS_SQL, ("wort", 1)).fetchall()
+    conn.close()
