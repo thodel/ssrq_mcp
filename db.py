@@ -152,6 +152,11 @@ def get_document(doc_id, with_text=True):
     return dict(row) if row else None
 
 
+# Loaded once per model and kept: 18,407 vectors is 75 MB of float32, and
+# rebuilding the array on every query would dominate the search itself.
+_VECTOR_CACHE: dict = {}
+
+
 def _load_matrix(model):
     """(chunk_ids, matrix) for a model, loaded once and cached."""
     key = (_DB_PATH, model)
