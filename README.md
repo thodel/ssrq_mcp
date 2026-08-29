@@ -8,7 +8,10 @@ Sources** (SSRQ · SDS · FDS) — to Claude and other MCP-compatible clients.
 The collection is published by the Rechtsquellenstiftung of the Swiss Law Society and
 comprises over 140 editions of legal-historical documents from the Middle Ages to 1798
 (<https://ssrq-sds-fds.ch>). This server serves the authority file behind those editions:
-23,674 persons, 7,047 organisations, and 138,298 name variants.
+27,996 persons, 9,134 organisations, and 81486 name variants
+(rebuilt from the register TTL by `ssrq_parse_ttl.py`, in this repo since #11 —
+the earlier build dropped ~4,300 persons and carried editorial timestamps as
+attestation years).
 
 ## Architecture
 
@@ -245,8 +248,8 @@ is added to the database later, they are resolved to full records automatically.
 
 ### Key notes
 
-- **Person IDs:** `per000001`–`per999999` (23,674 total)
-- **Org IDs:** `org000001`–`org999999` (7,047 total)
+- **Person IDs:** `per000001`–`per999999` (27,996 total)
+- **Org IDs:** `org000001`–`org999999` (9,134 total)
 - `orig_names` / `std_names` — original and normalised spelling variants (comma-joined)
 - `is_orig=1` in `name_index` means the name is the original spelling; `is_orig=0` is a
   normalised variant. Original spellings sort first in every variant listing.
