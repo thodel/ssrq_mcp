@@ -969,3 +969,102 @@ def test_stats_fall_back_to_the_person_range_without_documents(tmp_path):
 
     assert (stats["year_min"], stats["year_max"]) == (1200, 1500)
     assert stats["year_range_of"] == "persons"
+
+
+# ── A copy's date is not the document's date (#13) ────────────────────────────
+#
+# SSRQ-SG-III_4-202-1 is a 20th-century photocopy of a 1691 Ordnung. Its TEI
+# dates the document in <filiation> (when="1691-04-25") and the photocopy in
+# msDesc/history/origin (from="1901-01-01" to="2000-12-31"). Two independent
+# whole-file regexes took the start from one element and the end from the
+# other, and seven documents shipped as 1691–2000, 1438–1900 and the like.
+
+COPY_OF_1691 = """<TEI>
+ <msItem><filiation type="orig">Original</filiation>
+  <origDate when="1691-04-25"/>
+ </msItem>
+ <history><origin>
+  <origDate from="1901-01-01" to="2000-12-31"/>
+ </origin></history>
+ <body><p>Text</p></body>
+</TEI>"""
+
+
+def test_a_documents_date_never_pairs_with_a_copys():
+    import ingest_editio
+
+    assert ingest_editio.origination(COPY_OF_1691) == (1691, None)
+
+
+def test_a_genuine_range_keeps_both_ends():
+    """Pairing within one element must not cost real ranges their end."""
+    import ingest_editio
+
+    xml = '<origDate from="1523-01-01" to="1542-11-19"/>'
+    assert ingest_editio.origination(xml) == (1523, 1542)
+
+
+def test_when_only_and_undated_are_unchanged():
+    import ingest_editio
+
+    assert ingest_editio.origination('<origDate when="1446-01-19"/>') == (1446, None)
+    assert ingest_editio.origination("<TEI><body/></TEI>") == (None, None)
+
+
+def test_a_charter_quoted_inside_the_text_does_not_redate_the_document():
+    """The vidimus counterexample that killed the first version of this fix.
+
+    SSRQ-ZH-NF_I_2_1-170-1 is a 1497 vidimus; its transcription carries the
+    inserted 1275 charter's own origDate. "Earliest origDate wins" — the
+    obvious rule, and the one first implemented — would have redated the
+    vidimus to the charter it confirms. Measured over the whole corpus that
+    rule changed 202 documents, many wrongly. The header's origDate comes
+    first in the file, and it is the document's date.
+    """
+    import ingest_editio
+
+    vidimus = ('<msDesc><origDate when="1497-06-19"/></msDesc>'
+               '<body><origDate when="1275-02-27">1275</origDate></body>')
+    assert ingest_editio.origination(vidimus) == (1497, None)
+
+
+def test_a_later_hands_range_does_not_stretch_the_document():
+    """SSRQ-ZH-NF_I_2_1-196-1: issued 1502, a Nachtrag dated 1522-1537 in the
+    text. The old cross-element pairing shipped it as 1502-1537."""
+    import ingest_editio
+
+    xml = ('<origDate when="1502-09-20"/>'
+           '<origDate from="1522-01-01" to="1537-12-31">Nachtrag</origDate>')
+    assert ingest_editio.origination(xml) == (1502, None)
+
+
+def test_update_dates_fixes_dates_and_touches_nothing_else(tmp_path):
+    import sqlite3
+    import db as db_module
+    import ingest_editio
+
+    src = tmp_path / "editio"
+    (src / "data" / "SG" / "SG_III_4").mkdir(parents=True)
+    (src / "data" / "SG" / "SG_III_4" / "SSRQ-SG-III_4-202-1.xml").write_text(
+        '<TEI><idno>SSRQ-SG-III_4-202-1</idno>' + COPY_OF_1691[5:],
+        encoding="utf-8")
+
+    path = tmp_path / "ssrq.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(db_module.SCHEMA_SQL)
+    conn.execute("INSERT INTO documents (id, canton, origin_from, origin_to, "
+                 "text, n_chars) VALUES ('SSRQ-SG-III_4-202-1', 'SG', 1691, "
+                 "2000, 'the transcription', 17)")
+    conn.commit(); conn.close()
+
+    changed = ingest_editio.update_dates(src, str(path), quiet=True)
+
+    conn = sqlite3.connect(path)
+    row = conn.execute("SELECT origin_from, origin_to, text FROM documents "
+                       "WHERE id='SSRQ-SG-III_4-202-1'").fetchone()
+    conn.close()
+    assert changed == 1
+    assert row == (1691, None, "the transcription")
+
+    # Idempotent: a second run changes nothing.
+    assert ingest_editio.update_dates(src, str(path), quiet=True) == 0
