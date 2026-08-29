@@ -672,7 +672,8 @@ def test_every_module_is_copied_into_the_image():
         p.name for p in root.glob("*.py")
         if not p.name.startswith("test_")
         # Pipeline scripts run on the host, not in the serving image.
-        and p.name not in {"ingest_editio.py", "embed_db.py", "conftest.py"}
+        and p.name not in {"ingest_editio.py", "embed_db.py", "conftest.py",
+                           "ssrq_parse_ttl.py"}
     }
     assert not shipped - copied, f"not COPYed into the image: {sorted(shipped - copied)}"
 
@@ -773,3 +774,198 @@ def test_search_semantic_end_to_end(tmp_path):
     assert hit["canton"] == "ZH"
     assert hit["url"] == "http://x"
     assert hit["score"] > 0.99
+
+
+# ── The ETL reads the register, not the editors (#11) ─────────────────────────
+#
+# The deployed database carried editorial save-timestamps as attestation years
+# (Leo Jud, 1482-1542, "attested 2019") and HLS reference ids as years (his
+# HLS id 12013 became the year 1201). get_persons_by_year was wrong at both
+# ends: around 1200 it returned 18th-century people, around 2000 reformers.
+# The fixture below carries every trap the live data holds.
+
+FIXTURE_TTL = """
+@prefix pers: <http://ssrq-sds-fds.ch/Register/schemas/persons/> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+<http://ssrq-sds-fds.ch/Register/#per012654>
+        a                pers:person ;
+        rdfs:label       "Leo Jud"@deu ;
+        pers:births      [ pers:birth "1482" ; pers:occurence "ssrq-zh" ] ;
+        pers:deaths      [ pers:death "19.06.1542" ; pers:occurence "pascale" ] ;
+        pers:hist        [ pers:date "2019-11-28 10:50:05.239828" ;
+                           pers:username "pascale" ] ;
+        pers:name        [ pers:forename "Leo" ; pers:lang "deu" ;
+                           pers:type "std" ] ;
+        pers:occupation  [ pers:date "1523-1542" ;
+                           pers:description "key000301" ] ;
+        pers:refs        [ pers:id "12013" ; pers:type "HLS" ] ;
+        pers:refs        [ pers:id "118558528" ; pers:type "GND" ] ;
+        pers:sex         "1" .
+
+<http://ssrq-sds-fds.ch/Register/#per099001>
+        a                pers:person ;
+        rdfs:label       "Katharina Muster"@deu ;
+        pers:births      [ pers:birth "um 1410" ] ;
+        pers:first_mentions
+                         [ pers:first_mention "1448" ;
+                           pers:format_dates [ pers:when "1448" ] ] ;
+        pers:hist        [ pers:date "2020-09-30 16:47:49" ;
+                           pers:username "ssrq-zh" ] ;
+        pers:name        [ pers:forename "Katharina" ; pers:surname "Muster" ;
+                           pers:type "std" ] ;
+        pers:name        [ pers:forename "Katherly" ; pers:type "orig" ] ;
+        pers:sex         "2" .
+"""
+
+
+@pytest.fixture()
+def register(tmp_path):
+    pytest.importorskip("rdflib", reason="the ETL parses Turtle with rdflib")
+    import ssrq_parse_ttl
+
+    ttl = tmp_path / "register.ttl"
+    ttl.write_text(FIXTURE_TTL, encoding="utf-8")
+    persons, orgs, warnings = ssrq_parse_ttl.build(str(ttl), verbose=False)
+    return persons, orgs, warnings
+
+
+def test_attestation_years_and_only_attestation_years(register):
+    persons, _, _ = register
+    jud = persons["per012654"]
+
+    # birth 1482, occupation range 1523+1542, death day-format 1542.
+    assert jud["years"] == [1482, 1523, 1542]
+    assert (jud["first_year"], jud["last_year"]) == (1482, 1542)
+
+
+def test_the_editors_timestamp_is_not_an_attestation(register):
+    """pers:hist is when a researcher last touched the record. Out of scope."""
+    persons, _, _ = register
+    for person in persons.values():
+        assert all(year < 2000 for year in person["years"]), person["id"]
+
+
+def test_a_reference_id_is_never_a_year(register):
+    """Leo Jud's HLS id is 12013; the old ETL read it as the year 1201."""
+    persons, _, _ = register
+    assert 1201 not in persons["per012654"]["years"]
+
+
+def test_day_month_digits_are_not_years(register):
+    """"19.06.1542" contributes 1542 — not 1906, not 19, not 6."""
+    persons, _, _ = register
+    assert 1906 not in persons["per012654"]["years"]
+
+
+def test_approximate_dates_still_yield_their_year(register):
+    persons, _, _ = register
+    kat = persons["per099001"]
+    assert kat["years"] == [1410, 1448]
+
+
+def test_names_do_not_bleed_between_persons(register):
+    """The deployed db gave Katharina von Frauenberg the forename 'Heinrich
+    Ulrich' — the old line-scanner mixed blank nodes across entities."""
+    persons, _, _ = register
+    assert persons["per012654"]["forename"] == "Leo"
+    assert persons["per099001"]["forename"] == "Katharina"
+    assert persons["per099001"]["orig_names"] == ["Katherly"]
+
+
+def test_the_rebuilt_db_answers_like_the_server_would(register, tmp_path):
+    import json as json_module
+    import ssrq_parse_ttl
+
+    persons, orgs, _ = register
+    out = tmp_path / "register.db"
+    ssrq_parse_ttl.write(str(out), persons, orgs, replace=False)
+
+    import sqlite3
+    conn = sqlite3.connect(out)
+    year_max = conn.execute("SELECT MAX(last_year) FROM persons").fetchone()[0]
+    around_2000 = conn.execute(
+        "SELECT COUNT(*) FROM persons WHERE first_year IS NOT NULL "
+        "AND last_year IS NOT NULL AND first_year <= 2099 AND last_year >= 1990"
+    ).fetchone()[0]
+    names = conn.execute(
+        "SELECT COUNT(*) FROM name_index WHERE ssrq_id='per099001'"
+    ).fetchone()[0]
+    conn.close()
+
+    assert year_max == 1542
+    assert around_2000 == 0, "nobody in this register is attested around 2000"
+    assert names == 2
+
+
+def test_replace_leaves_the_other_tables_alone(register, tmp_path):
+    """The deployed db also holds documents, chunks and embeddings; a register
+    rebuild must not touch them."""
+    import sqlite3
+    import ssrq_parse_ttl
+    import db as db_module
+
+    persons, orgs, _ = register
+    out = tmp_path / "full.db"
+    conn = sqlite3.connect(out)
+    conn.executescript(db_module.SCHEMA_SQL)
+    conn.execute("INSERT INTO persons (id) VALUES ('stale')")
+    conn.execute(
+        "INSERT INTO documents (id, canton, text) VALUES ('SSRQ-ZH-1','ZH','x')")
+    conn.commit(); conn.close()
+
+    ssrq_parse_ttl.write(str(out), persons, orgs, replace=True)
+
+    conn = sqlite3.connect(out)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM persons WHERE id='stale'").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 1
+    conn.close()
+
+
+def test_stats_year_range_describes_the_documents(tmp_path):
+    """The evidence span, not the authority file's.
+
+    corpus_stats reported the person-attestation range as year_min/year_max,
+    and consumers comparing it with the documented edition span read the
+    difference as drift (ch-h-bot#284). The two legitimately differ: a person
+    can be born before the earliest document and attested after the last.
+    """
+    import sqlite3
+    import db as db_module
+
+    path = tmp_path / "stats.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(db_module.SCHEMA_SQL)
+    conn.execute("INSERT INTO persons (id, first_year, last_year) "
+                 "VALUES ('per1', 912, 1900)")
+    conn.execute("INSERT INTO documents (id, canton, origin_from, origin_to) "
+                 "VALUES ('SSRQ-ZH-1', 'ZH', 1050, 1052)")
+    conn.execute("INSERT INTO documents (id, canton, origin_from) "
+                 "VALUES ('SSRQ-VD-1', 'VD', 1846)")
+    conn.commit(); conn.close()
+    db_module.set_db_path(str(path))
+
+    stats = db_module.stats()
+
+    assert (stats["year_min"], stats["year_max"]) == (1050, 1846)
+    assert stats["year_range_of"] == "documents"
+    assert (stats["persons_year_min"], stats["persons_year_max"]) == (912, 1900)
+
+
+def test_stats_fall_back_to_the_person_range_without_documents(tmp_path):
+    import sqlite3
+    import db as db_module
+
+    path = tmp_path / "authority-only.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(db_module.SCHEMA_SQL)
+    conn.execute("INSERT INTO persons (id, first_year, last_year) "
+                 "VALUES ('per1', 1200, 1500)")
+    conn.commit(); conn.close()
+    db_module.set_db_path(str(path))
+
+    stats = db_module.stats()
+
+    assert (stats["year_min"], stats["year_max"]) == (1200, 1500)
+    assert stats["year_range_of"] == "persons"

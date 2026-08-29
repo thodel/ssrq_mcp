@@ -374,14 +374,50 @@ def _table_exists(c, name: str) -> bool:
 # ── Stats ─────────────────────────────────────────────────────────────────────
 
 def stats() -> dict:
+    """Corpus statistics, with year_min/year_max describing the EVIDENCE.
+
+    year_min/year_max used to come from the person authority file, which
+    meant "the years persons are attested", not "the years the documents
+    cover" — and consumers comparing them against the documented edition span
+    (1050-1846) read the difference as drift (ch-h-bot#284, #11). A person
+    can be born before the earliest document and attested after the last one,
+    so the two ranges legitimately differ.
+
+    year_min/year_max now describe the documents — what this server can serve
+    as evidence — and the authority file's span moves to its own keys. When no
+    documents are ingested, the person range fills in, labelled as such.
+    """
     with conn() as c:
-        return {
+        out = {
             "n_persons":    c.execute("SELECT COUNT(*) FROM persons").fetchone()[0],
             "n_orgs":       c.execute("SELECT COUNT(*) FROM orgs").fetchone()[0],
             "n_name_index": c.execute("SELECT COUNT(*) FROM name_index").fetchone()[0],
-            "year_min":     c.execute("SELECT MIN(first_year) FROM persons WHERE first_year IS NOT NULL").fetchone()[0],
-            "year_max":     c.execute("SELECT MAX(last_year)  FROM persons WHERE last_year  IS NOT NULL").fetchone()[0],
+            "persons_year_min": c.execute(
+                "SELECT MIN(first_year) FROM persons "
+                "WHERE first_year IS NOT NULL").fetchone()[0],
+            "persons_year_max": c.execute(
+                "SELECT MAX(last_year) FROM persons "
+                "WHERE last_year IS NOT NULL").fetchone()[0],
         }
+        has_documents = c.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='documents'").fetchone()
+        doc_min = doc_max = None
+        if has_documents:
+            doc_min = c.execute(
+                "SELECT MIN(origin_from) FROM documents "
+                "WHERE origin_from IS NOT NULL").fetchone()[0]
+            doc_max = c.execute(
+                "SELECT MAX(COALESCE(origin_to, origin_from)) FROM documents "
+                "WHERE origin_from IS NOT NULL").fetchone()[0]
+        if doc_min is not None:
+            out["year_min"], out["year_max"] = doc_min, doc_max
+            out["year_range_of"] = "documents"
+        else:
+            out["year_min"] = out["persons_year_min"]
+            out["year_max"] = out["persons_year_max"]
+            out["year_range_of"] = "persons"
+        return out
 
 
 # ── Persons ───────────────────────────────────────────────────────────────────
