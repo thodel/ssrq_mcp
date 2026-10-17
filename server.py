@@ -102,9 +102,9 @@ def search_semantic(query: str, limit: int = 20, year_from: int = 0,
     often the point of the question. `per_document` caps how many passages one
     document may contribute, so a long ordinance cannot crowd out the rest.
     """
-    import embeddings as emb
+    import corpus
 
-    vector = emb.embed_query(query)
+    vector = corpus.embed_query(query)
     return db_module.search_semantic(
         vector, limit=limit,
         year_from=year_from or None, year_to=year_to or None,
