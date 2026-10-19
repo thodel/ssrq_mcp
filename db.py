@@ -1,6 +1,7 @@
 """db.py — read-only SQLite helpers for the SSRQ MCP server."""
 import os
 import re
+import json
 import sqlite3
 from contextlib import contextmanager
 from typing import Any, Optional
@@ -361,8 +362,26 @@ def like_pattern(query: Optional[str]) -> str:
 
 
 def _split_ids(ids_str: Optional[str]) -> list[str]:
-    """The relation columns hold comma-joined ids ('per000001,per000002')."""
-    return [i.strip() for i in (ids_str or "").split(",") if i.strip()]
+    """The ids in a relation column, whatever the stored form.
+
+    ssrq_parse_ttl.py writes the five relation columns as JSON arrays —
+    '[]', '["loc008882"]' — and an older build wrote comma-joined ids
+    ('per000001,per000002'). Only the comma form was split here, so a JSON
+    column went through as ONE id: related_persons answered
+    places=[{"id": "[]"}] and organisations=[] for a person whose org_ids is
+    '["org000039"]' (measured on the live server, 14./19.10.2026, issue #15).
+    """
+    text = (ids_str or "").strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, list):
+            return [str(i).strip() for i in parsed if str(i).strip()]
+    return [i.strip() for i in text.split(",") if i.strip()]
 
 
 def _table_exists(c, name: str) -> bool:

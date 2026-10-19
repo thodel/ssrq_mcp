@@ -244,6 +244,51 @@ def test_related_persons_resolves_links():
     tr.assert_ok()
 
 
+def test_split_ids_reads_json_and_the_older_comma_form():
+    import db as db_mod
+    assert db_mod._split_ids('["loc008882","loc000001"]') == ["loc008882", "loc000001"]
+    assert db_mod._split_ids("[]") == []
+    assert db_mod._split_ids('["org000039"]') == ["org000039"]
+    assert db_mod._split_ids("per000001,per000002") == ["per000001", "per000002"]
+    assert db_mod._split_ids("") == [] and db_mod._split_ids(None) == []
+    assert db_mod._split_ids("[not json") == ["[not json"], "an unparsable value is not dropped"
+
+
+def test_related_persons_parses_the_json_relation_columns():
+    """Production stores every relation column as a JSON array (ssrq_parse_ttl.py);
+    the server split only commas, so '["loc008882"]' went through as one id and
+    '[]' became the place {"id": "[]"} (measured live on 14.10.2026, issue #15)."""
+    tr = Checks()
+    with tempfile.TemporaryDirectory() as tmp:
+        db = make_fixture_db(f"{tmp}/ssrq.db")
+        con = sqlite3.connect(f"{tmp}/ssrq.db")
+        con.executemany(
+            f"INSERT INTO persons VALUES ({','.join('?' * 19)})", [
+            ("per000005", "u5", "person", "Johann von Wangs", "de", "Wangs, Johann von",
+             "Johann", "Wangs", "m", 1342, 1342, "[1342]", '["org000001"]', "[]", "[]",
+             '["per000001"]', '["loc008882","loc000001"]', '["Johans"]', '["Johann"]'),
+            ("per000006", "u6", "person", "Ohne Orte", "de", "Orte, Ohne",
+             "Ohne", "Orte", "m", 1400, 1400, "[1400]", "[]", "[]", "[]", "[]", "[]", "[]", "[]"),
+        ])
+        con.commit(); con.close()
+
+        rel = db.related_persons("per000005")
+        tr.check(rel["places"] == [{"id": "loc008882"}, {"id": "loc000001"}],
+                 f"a JSON loc_ids column yields one entry per id (got {rel['places']})")
+        tr.check("places_note" in rel, "unresolved places are still flagged with the note")
+        tr.check([o["id"] for o in rel["organisations"]] == ["org000001"],
+                 f"a JSON org_ids column resolves against orgs (got {rel['organisations']})")
+        tr.check([f["id"] for f in rel["fathers"]] == ["per000001"],
+                 "a JSON father_ids column resolves against persons")
+        tr.check(rel["spouses"] == [] and rel["mothers"] == [], "'[]' relations yield []")
+
+        none = db.related_persons("per000006")
+        tr.check(none["places"] == [], f"'[]' yields an empty list, not {{'id': '[]'}} (got {none['places']})")
+        tr.check("places_note" not in none, "no note when there are no places")
+        tr.check(none["organisations"] == [], "'[]' org_ids yield []")
+    tr.assert_ok()
+
+
 def test_persons_by_year_overlap():
     tr = Checks()
     with tempfile.TemporaryDirectory() as tmp:
