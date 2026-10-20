@@ -235,7 +235,9 @@ error object.
 **Places.** `related_persons` resolves `spouse_ids`, `mother_ids`, `father_ids`, and
 `org_ids` against the `persons` and `orgs` tables. `loc_ids` point at the SSRQ place
 authority, which this database does not currently carry: those ids are returned as bare
-`{"id": ...}` entries together with a `places_note`. If a `places` (or `locations`) table
+`{"id": ...}` entries, one per id (14,555 of 27,996 persons have at least one; 2,322
+distinct place ids), together with a `places_note`; a person without places gets `[]`
+and no note. If a `places` (or `locations`) table
 is added to the database later, they are resolved to full records automatically.
 
 ## Database schema
@@ -254,7 +256,9 @@ is added to the database later, they are resolved to full records automatically.
 - `is_orig=1` in `name_index` means the name is the original spelling; `is_orig=0` is a
   normalised variant. Original spellings sort first in every variant listing.
 - The relation columns (`org_ids`, `spouse_ids`, `mother_ids`, `father_ids`, `loc_ids`)
-  are comma-joined id lists; `related_persons` resolves them all in one call.
+  are JSON arrays of ids (`'["org000039"]'`, `'[]'`), as `ssrq_parse_ttl.py` writes
+  them; `related_persons` parses them all and resolves them in one call. A comma-joined
+  list from an older build is still accepted.
 
 ## Deployment
 
