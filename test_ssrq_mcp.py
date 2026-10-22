@@ -760,7 +760,7 @@ def test_every_module_is_copied_into_the_image():
         if not p.name.startswith("test_")
         # Pipeline scripts run on the host, not in the serving image.
         and p.name not in {"ingest_editio.py", "embed_db.py", "conftest.py",
-                           "ssrq_parse_ttl.py"}
+                           "ssrq_parse_ttl.py", "migrate_parent_id.py"}
     }
     assert not shipped - copied, f"not COPYed into the image: {sorted(shipped - copied)}"
 
@@ -807,7 +807,7 @@ def test_every_sql_statement_matches_the_schema(tmp_path):
     conn.executescript(db.SCHEMA_SQL)
     conn.executescript(db.EMBEDDING_SCHEMA_SQL)
 
-    conn.execute(db._SEMANTIC_SQL.format(placeholders="?"), ("x",)).fetchall()
+    conn.execute(db._JOIN_SQL.format(placeholders="?"), ("x",)).fetchall()
     conn.execute(db._DOC_FTS_SQL, ("wort", 1)).fetchall()
     conn.close()
 
@@ -837,7 +837,7 @@ def test_search_semantic_end_to_end(tmp_path):
         "('SSRQ-ZH-T-1-1','ZH','ZH_T','Ordnung betreffend die Witwen','de',"
         "1446,1468,'Zürich','Wie froͧwen ußgericht werden soͤllen.',36,'http://x')")
     conn.execute(
-        "INSERT INTO chunks (chunk_id, doc_id, chunk_index, char_start, char_end, text) "
+        "INSERT INTO chunks (chunk_id, parent_id, chunk_index, char_start, char_end, text) "
         "VALUES ('SSRQ-ZH-T-1-1#0','SSRQ-ZH-T-1-1',0,0,36,"
         "'Wie froͧwen ußgericht werden soͤllen.')")
     # A unit vector, so the dot product is defined and the result deterministic.
@@ -849,8 +849,7 @@ def test_search_semantic_end_to_end(tmp_path):
          struct.pack(f"<{dims}f", *vector)))
     conn.commit(); conn.close()
 
-    db.set_db_path(str(path))
-    db._VECTOR_CACHE.clear()
+    db.set_db_path(str(path))        # also drops the cached matrix
     hits = db.search_semantic(vector, limit=5, model="test-model")
 
     assert len(hits) == 1
@@ -861,6 +860,351 @@ def test_search_semantic_end_to_end(tmp_path):
     assert hit["canton"] == "ZH"
     assert hit["url"] == "http://x"
     assert hit["score"] > 0.99
+
+
+
+# ── The shared embed_db.py and vectorstore.py (#18) ───────────────────────────
+#
+# Until #18 this repo had its own embed_db.py: `chunks.doc_id` instead of the
+# shared `parent_id`, `embedding_runs.n_articles` instead of `n_parents`, and
+# a head `title origin_from` on every passage. ch-h-bot#555 measured on the
+# production index that the shared embed_db.py, fed by corpus.iter_documents,
+# writes all 18,407 passages row-identical — so the vectors stay and the move
+# is a rename. These tests pin that down on a fixture: the rows below were
+# produced by the OLD embed_db.py (57779f0) on these documents, before it was
+# deleted, and the new pipeline has to reproduce them character for character.
+
+# db.EMBEDDING_SCHEMA_SQL as it was before #18, verbatim — the schema a
+# production database still has when migrate_parent_id.py meets it.
+OLD_EMBEDDING_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS chunks (
+    chunk_id    TEXT    PRIMARY KEY,   -- "<doc_id>#<chunk_index>"
+    doc_id    TEXT    NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    char_start  INTEGER NOT NULL,
+    char_end    INTEGER NOT NULL,
+    text        TEXT    NOT NULL,      -- the transcription as edited, tags stripped
+    UNIQUE (doc_id, chunk_index)
+);
+CREATE TABLE IF NOT EXISTS embeddings (
+    chunk_id TEXT    PRIMARY KEY REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+    model    TEXT    NOT NULL,
+    dims     INTEGER NOT NULL,
+    vector   BLOB    NOT NULL          -- float32, little-endian, L2-normalised
+);
+CREATE TABLE IF NOT EXISTS embedding_runs (
+    run_id      TEXT PRIMARY KEY,
+    started_at  TEXT NOT NULL,
+    finished_at TEXT,
+    model       TEXT NOT NULL,
+    dims        INTEGER,
+    base_url    TEXT,
+    chunk_chars INTEGER,
+    chunk_overlap INTEGER,
+    n_articles  INTEGER,
+    n_chunks    INTEGER,
+    notes       TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_chunks_entry ON chunks(doc_id);
+CREATE INDEX IF NOT EXISTS ix_embeddings_model ON embeddings(model);
+"""
+
+_LONG = " ".join(
+    f"Item {i} Der rat ze Zürich hat gesetzt un̄ und geordnet, daz die froͧwen ✳ "
+    f"ir guot behalten soͤllen. Hein r₎ rich der schriber hat ez geschriben."
+    for i in range(1, 15))
+
+# The traps: an abbreviation whose expansion joins the token before it ("Hein
+# r₎ rich" → Heinrich; the vocabulary says "Hein" is a fragment 15 times and a
+# word once), segment markers, a document long enough for three windows with
+# overlap, a title with a trailing blank, a missing title, a missing year, and
+# two documents without a transcription.
+DOCS = [
+    # id, canton, volume, title, lang, origin_from, origin_to, place, text, n_chars, url
+    ("SSRQ-ZH-T-1-1", "ZH", "ZH_T", "Ordnung betreffend die Witwen", "de", 1446, 1468,
+     "Zürich", "Wie froͧwen ußgericht werden soͤllen.", 36, "http://x/1"),
+    ("SSRQ-FR-T-2-1", "FR", "FR_T", "Urkunde Heinrichs", "de", 1360, None, "Freiburg",
+     "Hein r₎ rich un̄ und sin bruoder ✳ Diz ist dˀ der stif tˀin terin, ✳ ist dˀ der "
+     "brief. Hein ist ein name.", 80, "http://x/2"),
+    ("SSRQ-SG-T-3-1", "SG", "SG_T", "Lange Satzung", "de", 1512, 1512, "St. Gallen",
+     _LONG, len(_LONG), "http://x/3"),
+    ("SSRQ-VD-T-4-1", "VD", "VD_T", "Satzung ", "fr", None, None, "Lausanne",
+     "Nous le conseil ✳ ordonnons que nul ne vende.", 44, "http://x/4"),
+    ("SSRQ-NE-T-5-1", "NE", "NE_T", None, "fr", 1500, None, "Neuchâtel",
+     "Item que les bourgeois paient.", 30, "http://x/5"),
+    ("SSRQ-ZH-T-6-1", "ZH", "ZH_T", "Leer", "de", 1600, None, "Zürich", None, 0, "http://x/6"),
+    ("SSRQ-ZH-T-7-1", "ZH", "ZH_T", "Leer zwei", "de", 1601, None, "Zürich", "", 0, "http://x/7"),
+]
+
+# (chunk_id, doc_id, chunk_index, char_start, char_end, text) — what the old
+# embed_db.build_chunks wrote for DOCS with chunk_chars=1000, overlap=150. The
+# expansions reflect the fixture's own vocabulary ("gesetzt" precedes a raw
+# form in every item, so it counts as a fragment and takes its expansion).
+OLD_ROWS = [('SSRQ-FR-T-2-1#0',
+  'SSRQ-FR-T-2-1',
+  0,
+  0,
+  79,
+  'Urkunde Heinrichs 1360\n'
+  'Heinrich und sin bruoder Diz istder stifterin, istder brief. Hein ist ein name.'),
+ ('SSRQ-NE-T-5-1#0', 'SSRQ-NE-T-5-1', 0, 0, 30, '1500\nItem que les bourgeois paient.'),
+ ('SSRQ-SG-T-3-1#0',
+  'SSRQ-SG-T-3-1',
+  0,
+  0,
+  931,
+  'Lange Satzung 1512\n'
+  'Item 1 Der rat ze Zürich hat gesetztund geordnet, daz die froͧwen ir guot behalten '
+  'soͤllen. Heinrich der schriber hat ez geschriben. Item 2 Der rat ze Zürich hat '
+  'gesetztund geordnet, daz die froͧwen ir guot behalten soͤllen. Heinrich der '
+  'schriber hat ez geschriben. Item 3 Der rat ze Zürich hat gesetztund geordnet, daz '
+  'die froͧwen ir guot behalten soͤllen. Heinrich der schriber hat ez geschriben. Item '
+  '4 Der rat ze Zürich hat gesetztund geordnet, daz die froͧwen ir guot behalten '
+  'soͤllen. Heinrich der schriber hat ez geschriben. Item 5 Der rat ze Zürich hat '
+  'gesetztund geordnet, daz die froͧwen ir guot behalten soͤllen. Heinrich der '
+  'schriber hat ez geschriben. Item 6 Der rat ze Zürich hat gesetztund geordnet, daz '
+  'die froͧwen ir guot behalten soͤllen. Heinrich der schriber hat ez geschriben. Item '
+  '7 Der rat ze Zürich hat gesetztund geordnet, daz die froͧwen ir guot behalten '
+  'soͤllen. Heinrich der schriber hat ez geschriben.'),
+ ('SSRQ-SG-T-3-1#1',
+  'SSRQ-SG-T-3-1',
+  1,
+  781,
+  1733,
+  'Lange Satzung 1512\n'
+  't ez geschriben. Item 7 Der rat ze Zürich hat gesetztund geordnet, daz die froͧwen '
+  'ir guot behalten soͤllen. Heinrich der schriber hat ez geschriben. Item 8 Der rat '
+  'ze Zürich hat gesetztund geordnet, daz die froͧwen ir guot behalten soͤllen. '
+  'Heinrich der schriber hat ez geschriben. Item 9 Der rat ze Zürich hat gesetztund '
+  'geordnet, daz die froͧwen ir guot behalten soͤllen. Heinrich der schriber hat ez '
+  'geschriben. Item 10 Der rat ze Zürich hat gesetztund geordnet, daz die froͧwen ir '
+  'guot behalten soͤllen. Heinrich der schriber hat ez geschriben. Item 11 Der rat ze '
+  'Zürich hat gesetztund geordnet, daz die froͧwen ir guot behalten soͤllen. Heinrich '
+  'der schriber hat ez geschriben. Item 12 Der rat ze Zürich hat gesetztund geordnet, '
+  'daz die froͧwen ir guot behalten soͤllen. Heinrich der schriber hat ez geschriben. '
+  'Item 13 Der rat ze Zürich hat gesetztund geordnet, daz die froͧwen ir guot behalten '
+  'soͤllen. Heinrich der schriber hat ez geschriben.'),
+ ('SSRQ-SG-T-3-1#2',
+  'SSRQ-SG-T-3-1',
+  2,
+  1583,
+  1866,
+  'Lange Satzung 1512\n'
+  'ez geschriben. Item 13 Der rat ze Zürich hat gesetztund geordnet, daz die froͧwen '
+  'ir guot behalten soͤllen. Heinrich der schriber hat ez geschriben. Item 14 Der rat '
+  'ze Zürich hat gesetztund geordnet, daz die froͧwen ir guot behalten soͤllen. '
+  'Heinrich der schriber hat ez geschriben.'),
+ ('SSRQ-VD-T-4-1#0',
+  'SSRQ-VD-T-4-1',
+  0,
+  0,
+  43,
+  'Satzung \nNous le conseil ordonnons que nul ne vende.'),
+ ('SSRQ-ZH-T-1-1#0',
+  'SSRQ-ZH-T-1-1',
+  0,
+  0,
+  37,
+  'Ordnung betreffend die Witwen 1446\nWie froͧwen ußgericht werden soͤllen.')]
+
+_DIMS = 8
+
+
+def _unit_vector(i):
+    """A different unit vector per chunk, so a query picks exactly one."""
+    v = [0.0] * _DIMS
+    v[i % _DIMS] = 1.0
+    return v
+
+
+def _old_layout_db(path):
+    """A database as production has it before the migration: old schema, the
+    old rows, one vector per chunk, one finished run with n_articles."""
+    import struct
+
+    import db
+
+    con = sqlite3.connect(path)
+    con.executescript(db.SCHEMA_SQL)
+    con.executescript(OLD_EMBEDDING_SCHEMA_SQL)
+    con.executemany("INSERT INTO documents VALUES (?,?,?,?,?,?,?,?,?,?,?)", DOCS)
+    con.executemany("INSERT INTO chunks VALUES (?,?,?,?,?,?)", OLD_ROWS)
+    con.executemany(
+        "INSERT INTO embeddings (chunk_id, model, dims, vector) VALUES (?,?,?,?)",
+        [(row[0], "test-model", _DIMS, struct.pack(f"<{_DIMS}f", *_unit_vector(i)))
+         for i, row in enumerate(OLD_ROWS)])
+    con.execute(
+        "INSERT INTO embedding_runs (run_id, started_at, finished_at, model, dims, "
+        "chunk_chars, chunk_overlap, n_articles, n_chunks) "
+        "VALUES ('r1','2026-10-01T00:00:00Z','2026-10-01T00:01:00Z','test-model',?,"
+        "1000,150,5,7)", (_DIMS,))
+    con.commit(); con.close()
+
+
+def _schema(path):
+    con = sqlite3.connect(path)
+    cols = [r[1] for r in con.execute("PRAGMA table_info(chunks)")]
+    run_cols = [r[1] for r in con.execute("PRAGMA table_info(embedding_runs)")]
+    idx = sorted(r[1] for r in con.execute("PRAGMA index_list(chunks)")
+                 if not r[1].startswith("sqlite_autoindex"))
+    con.close()
+    return cols, run_cols, idx
+
+
+def test_the_head_and_the_clean_are_the_old_ones(tmp_path):
+    """The new pipeline — corpus.iter_documents → the shared build_chunks —
+    writes the rows the old embed_db.py wrote, character for character:
+    head, offsets, expansions. A .strip() on the head or a different window
+    would show up here as it did in the measurement (ch-h-bot#555)."""
+    import corpus
+    import db
+    import embed_db
+
+    path = tmp_path / "new.db"
+    con = sqlite3.connect(path)
+    con.executescript(db.SCHEMA_SQL)
+    con.executescript(db.EMBEDDING_SCHEMA_SQL)
+    con.executemany("INSERT INTO documents VALUES (?,?,?,?,?,?,?,?,?,?,?)", DOCS)
+    assert embed_db.build_chunks(con, None, 1000, 150, quiet=True) == len(OLD_ROWS)
+    rows = con.execute("SELECT chunk_id, parent_id, chunk_index, char_start, "
+                       "char_end, text FROM chunks ORDER BY chunk_id").fetchall()
+    assert rows == OLD_ROWS
+
+    # The head: `title origin_from`, no strip, a missing part left out.
+    assert corpus.head_line("Ordnung betreffend die Witwen", 1446) == \
+        "Ordnung betreffend die Witwen 1446"
+    assert corpus.head_line("Satzung ", None) == "Satzung "
+    assert corpus.head_line(None, 1500) == "1500"
+    assert corpus.head_line(None, None) == ""
+    assert corpus.head_line("Ordnung", 0) == "Ordnung"        # 0 counted as missing, as before
+
+    # The clean, with the vocabulary the corpus provides.
+    assert corpus.clean(DOCS[1][8]) == \
+        "Heinrich und sin bruoder Diz istder stifterin, istder brief. Hein ist ein name."
+
+    # A --limit run still judges fragments on the WHOLE corpus: one document
+    # yielded, but "Hein" is still a fragment 15 times, a word once.
+    corpus._VOCAB.clear()
+    con.execute("DELETE FROM chunks")
+    yielded = list(corpus.iter_documents(con, limit=1))
+    assert len(yielded) == 1 and yielded[0][0] == "SSRQ-FR-T-2-1"
+    assert corpus._VOCAB["hein"] == (15, 1)
+    assert yielded[0][1] == "Urkunde Heinrichs 1360"
+    con.close()
+
+
+def test_the_migration_keeps_every_vector_and_the_shared_embed_db_finds_them(tmp_path):
+    """migrate_parent_id.py on a production-shaped database: afterwards the
+    shared embed_db.py chunks nothing new and embeds nothing, search_semantic
+    runs through vectorstore, and a second run of the migration is a no-op."""
+    import db
+    import embed_db
+    import migrate_parent_id
+    import vectorstore
+
+    path = str(tmp_path / "ssrq.db")
+    _old_layout_db(path)
+    assert _schema(path) == (
+        ["chunk_id", "doc_id", "chunk_index", "char_start", "char_end", "text"],
+        ["run_id", "started_at", "finished_at", "model", "dims", "base_url",
+         "chunk_chars", "chunk_overlap", "n_articles", "n_chunks", "notes"],
+        ["ix_chunks_entry"])
+
+    assert migrate_parent_id.main(["--db", path]) == 0
+    cols, run_cols, idx = _schema(path)
+    assert cols == ["chunk_id", "parent_id", "chunk_index", "char_start", "char_end", "text"]
+    assert "n_parents" in run_cols and "n_articles" not in run_cols
+    assert idx == ["ix_chunks_parent"]        # the old index is gone, not merely re-pointed
+
+    # The shared SCHEMA_SQL on top (as embed_db.main runs it) adds nothing.
+    con = sqlite3.connect(path)
+    con.executescript(vectorstore.SCHEMA_SQL)
+    assert _schema(path)[2] == ["ix_chunks_parent"]
+    # Nothing to chunk, nothing to embed: every chunk still has its vector.
+    assert embed_db.build_chunks(con, None, 1000, 150, quiet=True) == 0
+    assert embed_db.embed_pending(con, "test-model", 64, quiet=True) == (0, 0)
+    assert con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == len(OLD_ROWS)
+    assert con.execute("SELECT n_parents FROM embedding_runs").fetchone()[0] == 5
+    con.close()
+
+    db.set_db_path(path)
+    stats = db.semantic_stats()
+    assert stats["indexed"] and stats["n_chunks"] == len(OLD_ROWS)
+    assert stats["n_indexed"] == 5 and stats["n_total"] == 7
+    assert "n_entries_indexed" not in stats and "n_entries_total" not in stats
+    assert stats["coverage"] == round(5 / 7, 4)
+
+    # The query vector of chunk 2 (SSRQ-SG-T-3-1#0) finds that chunk, with the
+    # document's fields, and the snippet without its head.
+    hits = db.search_semantic(_unit_vector(2), limit=3, model="test-model")
+    assert hits[0]["id"] == "SSRQ-SG-T-3-1" and hits[0]["chunk_id"] == "SSRQ-SG-T-3-1#0"
+    assert hits[0]["year"] == 1512 and hits[0]["canton"] == "SG"
+    assert hits[0]["score"] > 0.99
+    assert hits[0]["snippet"].startswith("Item 1 Der rat")
+    assert (hits[0]["char_start"], hits[0]["char_end"]) == (0, 931)
+    # The year filter lives in row_to_hit: a document without a year is dropped.
+    assert db.search_semantic(_unit_vector(5), limit=3, model="test-model",
+                              year_from=1400)[0]["id"] != "SSRQ-VD-T-4-1"
+    assert all(h["year"] is not None and h["year"] >= 1400 for h in
+               db.search_semantic(_unit_vector(5), limit=10, model="test-model",
+                                  year_from=1400))
+
+    # Idempotent: the second run reports and changes nothing.
+    assert migrate_parent_id.main(["--db", path]) == 0
+    assert _schema(path) == (cols, run_cols, idx)
+
+
+def test_the_migration_refuses_a_database_it_does_not_recognise(tmp_path):
+    import migrate_parent_id
+
+    assert migrate_parent_id.main(["--db", str(tmp_path / "missing.db")]) == 1
+    path = str(tmp_path / "bare.db")
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE documents (id TEXT PRIMARY KEY, text TEXT)")
+    con.commit(); con.close()
+    assert migrate_parent_id.main(["--db", path]) == 1        # no index to migrate
+
+
+def test_the_snippet_starts_with_the_text_not_the_head():
+    """Fleet rule (ch-h-bot#555): the head `title origin_from` stays with the
+    vector; the hit shows the passage from its first word. Cut only when the
+    text starts with exactly this document's head, by the function that
+    writes it; offsets untouched."""
+    import corpus
+    import db
+
+    title, year = "Ordnung betreffend die Witwen", 1446
+    head = corpus.head_line(title, year)
+    piece = "roͧwen ußgericht werden soͤllen.\nUnd wer daz nit tuot."
+
+    def row(text, title=title, year=year):
+        return {"chunk_id": "SSRQ-ZH-T-1-1#1", "parent_id": "SSRQ-ZH-T-1-1",
+                "chunk_index": 1, "char_start": 850, "char_end": 1700, "text": text,
+                "title": title, "canton": "ZH", "volume": "ZH_T", "year": year,
+                "origin_to": 1468, "lang": "de", "place": "Zürich", "url": "http://x"}
+
+    hit = db._row_to_hit(row(f"{head}\n{piece}"), "SSRQ-ZH-T-1-1#1", 0.7)
+    assert hit["snippet"] == piece
+    assert hit["title"] == title and hit["year"] == year
+    assert (hit["char_start"], hit["char_end"]) == (850, 1700)
+
+    # No head (an index from before the head existed), or another document's
+    # head, or a title that merely happens to start the text: untouched.
+    assert db._row_to_hit(row(piece), "c", 0.7)["snippet"] == piece
+    other = f"{title} 1447\n{piece}"
+    assert db._row_to_hit(row(other), "c", 0.7)["snippet"] == other
+    same_line = f"{head} {piece}"
+    assert db._row_to_hit(row(same_line), "c", 0.7)["snippet"] == same_line
+    # A document without title or year has no head and nothing is cut.
+    assert db._row_to_hit(row(piece, None, None), "c", 0.7)["snippet"] == piece
+    # The trailing-blank title is cut exactly as it was written.
+    assert db.passage_body("Satzung \nNous le conseil.", "Satzung ", None) == "Nous le conseil."
+
+    # The filters: None drops the row.
+    assert db._row_to_hit(row(piece), "c", 0.7, year_from=1500) is None
+    assert db._row_to_hit(row(piece), "c", 0.7, year_to=1400) is None
+    assert db._row_to_hit(row(piece, year=None), "c", 0.7, year_from=1000) is None
+    assert db._row_to_hit(row(piece), "c", 0.7, year_from=1446, year_to=1446) is not None
 
 
 # ── The ETL reads the register, not the editors (#11) ─────────────────────────

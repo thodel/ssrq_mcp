@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # keeps the image small and means a new one has to be added here too —
 # hls_mcp shipped without its and the container crash-looped on the
 # import, with a clean build and no warning.
-COPY db.py server.py corpus.py embeddings.py ./
+COPY db.py server.py corpus.py embeddings.py vectorstore.py ./
 
 # ssrq.db is mounted at runtime (see docker-compose.yml). It is built by the SSRQ
 # project's ETL from the RDF-TTL dump, not by this image.
