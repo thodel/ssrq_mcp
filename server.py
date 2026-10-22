@@ -108,7 +108,7 @@ def search_semantic(query: str, limit: int = 20, year_from: int = 0,
     return db_module.search_semantic(
         vector, limit=limit,
         year_from=year_from or None, year_to=year_to or None,
-        per_document=per_document)
+        per_parent=per_document)
 
 
 @mcp.tool()

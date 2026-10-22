@@ -194,6 +194,10 @@ passing `POST` to the app (a static `location` or a `limit_except` is shadowing 
 | `search_name_index(query, type_filter="", limit=50)` | Search all 138k name variants; `type_filter` is `person`, `org`, or empty for both |
 | `get_name_variants(id)` | All name variants for a given person or org id |
 | `related_persons(pid)` | Spouses, mothers, fathers, organisations, and places, resolved to records |
+| `search_documents(query, limit=20)` | Keyword search over the transcribed editions (the scribe's spelling) |
+| `get_document(doc_id, with_text=True)` | One edited document by its TEI idno, with the transcription |
+| `search_semantic(query, limit=20, year_from=0, year_to=0, per_document=2)` | Passages from the editions that answer a question, matched by meaning; the snippet starts with the text, the head line stays with the vector |
+| `semantic_index_stats()` | `indexed`, `n_chunks`, `n_indexed`/`n_total` (documents), `coverage`, `models`, `recent_runs` |
 
 ## Available resources
 
@@ -240,6 +244,40 @@ distinct place ids), together with a `places_note`; a person without places gets
 and no note. If a `places` (or `locations`) table
 is added to the database later, they are resolved to full records automatically.
 
+## Semantic index
+
+The editions are embedded with the machinery every provider in the fleet shares
+(see ch-h-bot `docs/MCP_PROVIDER_PATTERN.md`): `embeddings.py`, `vectorstore.py` and
+`embed_db.py` are vendored **byte-identical** from
+[eperiodica_mcp](https://github.com/thodel/eperiodica_mcp) and never edited here —
+ch-h-bot's `scripts/check_vendored_drift.py` compares the checksums. What is particular
+to this corpus lives in `corpus.py`: the query instruction, the expansion of the
+edition's abbreviations to their expanded reading (`clean`), and the head line
+`title origin_from` that `iter_documents` puts on the first line of every passage, for
+the vector. A hit's `snippet` is the passage without that head; `char_start`/`char_end`
+count in the cleaned transcription.
+
+```bash
+GPUSTACK_API_KEY=... python embed_db.py --db ssrq.db             # build or resume
+python embed_db.py --db ssrq.db --status                          # nothing pending?
+```
+
+**Databases built before #18** carry the index under this repo's former column names
+(`chunks.doc_id`, `embedding_runs.n_articles`, index `ix_chunks_entry`). The passages
+and vectors are the same — measured on the production index in ch-h-bot#555, all 18,407
+passages row-identical — so the move is a rename, done once, with the server stopped
+and **after a backup you make yourself**:
+
+```bash
+cp ssrq.db ssrq.db.pre-parent-id
+python migrate_parent_id.py --db ssrq.db      # one transaction + integrity_check
+python embed_db.py --db ssrq.db --status      # n_chunks unchanged, nothing pending
+```
+
+A second run reports «already on parent_id» and changes nothing. A server from before
+#18 must not run against a migrated database (and vice versa): `db.py` asks for the
+column name of its own generation.
+
 ## Database schema
 
 | Table | Contents |
@@ -247,6 +285,8 @@ is added to the database later, they are resolved to full records automatically.
 | `persons` | id, uri, etype, label, label_lang, std_name, forename, surname, sex, first_year, last_year, years, org_ids, spouse_ids, mother_ids, father_ids, loc_ids, orig_names, std_names |
 | `orgs` | id, uri, etype, label, std_name, surname, alias_of, org_type |
 | `name_index` | name_text, ssrq_id, is_orig (138k variant → canonical mappings) |
+| `documents` | id (TEI idno), canton, volume, title, lang, origin_from, origin_to, place, text, n_chars, url — the editions, with an FTS5 mirror `documents_fts` |
+| `chunks`, `embeddings`, `embedding_runs` | the shared vector schema (`vectorstore.SCHEMA_SQL`): passages keyed `<parent_id>#<chunk_index>`, one L2-normalised float32 vector per passage and model, one row per indexing run |
 
 ### Key notes
 

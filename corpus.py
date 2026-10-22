@@ -6,17 +6,20 @@ embeddings.py is vendored byte-identical across the fleet (see ch-h-bot
 docs/MCP_PROVIDER_PATTERN.md); whatever is particular to this corpus lives
 here instead, so that the shared file can stay a checksum.
 
-This repo is on the older layout: embed_db.py and the semantic search in db.py
-are its own, not the shared ones. Its index stores `chunks.doc_id` (the
-shared schema says `parent_id`) and puts a heading (title, year) on the first
-line of every passage, which the shared embed_db.py cannot do. Moving to the shared files is
-a schema migration plus a full re-embed, so it is a deployment, not a sync.
+embed_db.py and vectorstore.py are vendored the same way (since #18). What
+they need from this module is the interface at the bottom of the file:
+DB_ENV / DEFAULT_DB / PARENT_TABLE, iter_documents() yielding
+(id, head, text) and clean(). The head on every passage and the expansion of
+abbreviations are exactly what this repo's own embed_db.py did until #18
+(measured in ch-h-bot#555: all 18,407 passages stay row-identical, so the
+vectors stay too).
 """
 
 from __future__ import annotations
 
 import os
 import re
+import sqlite3
 import unicodedata
 
 # The shared embeddings.py reads SSRQ_EMBED_MODEL, SSRQ_CHUNK_CHARS, ... only
@@ -136,3 +139,71 @@ def embed_query(query: str, model: str = emb.DEFAULT_MODEL, client=None) -> list
     if not vectors:
         raise emb.EmbeddingError("the embedding service returned no vector for the query")
     return vectors[0]
+
+
+# ── The interface the shared embed_db.py reads ───────────────────────────────
+
+DB_ENV = "SSRQ_DB"
+DEFAULT_DB = "/data/ssrq.db"
+PARENT_TABLE = "documents"
+
+# The expansion vocabulary (see build_vocab). iter_documents builds it over
+# the WHOLE documents table before its first yield, whatever `limit` says: the
+# fragment/word judgement needs every occurrence of a token, not just the ones
+# in this batch. The shared build_chunks calls iter_documents before the first
+# clean(), so by the time clean() runs the vocabulary is there.
+_VOCAB: dict = {}
+
+
+def build_corpus_vocab(conn: sqlite3.Connection) -> dict:
+    """Build the expansion vocabulary over every document and keep it for clean()."""
+    global _VOCAB
+    _VOCAB = build_vocab(
+        t for (t,) in conn.execute(
+            "SELECT text FROM documents WHERE text IS NOT NULL"))
+    return _VOCAB
+
+
+def clean(text: str) -> str:
+    """The hook embed_db.py hands to chunk_document: the expanded reading.
+
+    Uses the vocabulary of the last build_corpus_vocab()/iter_documents() call.
+    Without one, no expansion joins its fragment — call iter_documents first.
+    """
+    return clean_entry_text(text, _VOCAB)
+
+
+def head_line(title, year) -> str:
+    """The head on every passage: `title origin_from`, joined by one blank.
+
+    Copied from the embed_db.py this repo had until #18, character for
+    character: no strip, a missing title or year is simply left out. A charter
+    passage otherwise carries no trace of which document or century it belongs
+    to, and "the farm at Lind" reads the same in 1360 as 1644. embed_db.py puts
+    it verbatim on the first line of every passage; the offsets count in
+    clean(text) and know nothing of it. db.passage_body cuts it off a hit with
+    this same function, which is why there is exactly one place that builds it.
+    """
+    return " ".join(str(x) for x in (title, year) if x)
+
+
+def iter_documents(conn: sqlite3.Connection, limit=None):
+    """Yield (id, head, text) for every document that has no chunks yet.
+
+    Documents without a transcription are skipped, as before. `limit` keeps
+    its old meaning — a trial run on that many not-yet-chunked documents —
+    but the vocabulary is built over the whole table first, regardless.
+    """
+    build_corpus_vocab(conn)
+    has_chunks = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone()
+    sql = (
+        "SELECT e.id, e.title, e.origin_from, e.text FROM documents e "
+        "WHERE e.text IS NOT NULL AND e.text <> ''"
+        + (" AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.parent_id = e.id)"
+           if has_chunks else "")
+        + " ORDER BY e.id"
+        + (" LIMIT ?" if limit else ""))
+    rows = conn.execute(sql, (limit,) if limit else ()).fetchall()
+    for doc_id, title, year, text in rows:
+        yield doc_id, head_line(title, year), text

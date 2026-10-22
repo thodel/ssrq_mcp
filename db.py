@@ -1,10 +1,12 @@
 """db.py — read-only SQLite helpers for the SSRQ MCP server."""
-import os
 import re
 import json
 import sqlite3
 from contextlib import contextmanager
 from typing import Any, Optional
+
+import corpus
+import vectorstore
 
 _DB_PATH = "ssrq.db"
 
@@ -69,41 +71,12 @@ CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
 """
 
 
-# Chunk and vector tables, mirroring kf_mcp. Kept separate from SCHEMA_SQL so
-# a database built before the editions were ingested can be upgraded in place
-# rather than rebuilt.
-EMBEDDING_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS chunks (
-    chunk_id    TEXT    PRIMARY KEY,   -- "<doc_id>#<chunk_index>"
-    doc_id    TEXT    NOT NULL,
-    chunk_index INTEGER NOT NULL,
-    char_start  INTEGER NOT NULL,
-    char_end    INTEGER NOT NULL,
-    text        TEXT    NOT NULL,      -- the transcription as edited, tags stripped
-    UNIQUE (doc_id, chunk_index)
-);
-CREATE TABLE IF NOT EXISTS embeddings (
-    chunk_id TEXT    PRIMARY KEY REFERENCES chunks(chunk_id) ON DELETE CASCADE,
-    model    TEXT    NOT NULL,
-    dims     INTEGER NOT NULL,
-    vector   BLOB    NOT NULL          -- float32, little-endian, L2-normalised
-);
-CREATE TABLE IF NOT EXISTS embedding_runs (
-    run_id      TEXT PRIMARY KEY,
-    started_at  TEXT NOT NULL,
-    finished_at TEXT,
-    model       TEXT NOT NULL,
-    dims        INTEGER,
-    base_url    TEXT,
-    chunk_chars INTEGER,
-    chunk_overlap INTEGER,
-    n_articles  INTEGER,
-    n_chunks    INTEGER,
-    notes       TEXT
-);
-CREATE INDEX IF NOT EXISTS ix_chunks_entry ON chunks(doc_id);
-CREATE INDEX IF NOT EXISTS ix_embeddings_model ON embeddings(model);
-"""
+# The chunk and vector tables are the shared ones in vectorstore.SCHEMA_SQL
+# (chunks.parent_id, embedding_runs.n_parents). Until #18 this repo had its
+# own copy with chunks.doc_id; migrate_parent_id.py renames a database built
+# with it. Kept separate from SCHEMA_SQL so a database built before the
+# editions were ingested can be upgraded in place rather than rebuilt.
+EMBEDDING_SCHEMA_SQL = vectorstore.SCHEMA_SQL
 
 
 # ── Editions: full text and meaning ──────────────────────────────────────────
@@ -153,167 +126,96 @@ def get_document(doc_id, with_text=True):
     return dict(row) if row else None
 
 
-# Loaded once per model and kept: 18,407 vectors is 75 MB of float32, and
-# rebuilding the array on every query would dominate the search itself.
-_VECTOR_CACHE: dict = {}
-
-
-def _load_matrix(model):
-    """(chunk_ids, matrix) for a model, loaded once and cached."""
-    key = (_DB_PATH, model)
-    cached = _VECTOR_CACHE.get(key)
-    if cached is not None:
-        return cached
-    try:
-        import numpy as np
-    except ImportError as exc:
-        raise RuntimeError(
-            "numpy is required for semantic search — pip install numpy") from exc
-    with conn() as c:
-        rows = c.execute(
-            "SELECT chunk_id, dims, vector FROM embeddings WHERE model = ? "
-            "ORDER BY chunk_id", (model,)).fetchall()
-    if not rows:
-        raise RuntimeError(
-            f"no embeddings for model {model!r} in {_DB_PATH}. "
-            "Run embed_db.py to build the semantic index.")
-    dims = rows[0]["dims"]
-    chunk_ids = [row["chunk_id"] for row in rows]
-    # One contiguous buffer: the difference between a matrix multiply and
-    # thousands of small ones.
-    buffer = b"".join(row["vector"] for row in rows)
-    matrix = np.frombuffer(buffer, dtype="<f4").reshape(len(rows), dims)
-    _VECTOR_CACHE[key] = (chunk_ids, matrix)
-    return chunk_ids, matrix
-
-
-def search_semantic(query_vector, limit=20, model=None, year_from=None,
-                    year_to=None, per_document=2):
-    """Passages closest in meaning to an already-embedded query.
-
-    ``per_document`` caps how many passages one document may contribute, so a long
-    document cannot fill the result set and crowd out the other documents that
-    answer the question. ``year_from``/``year_to`` restrict to a period, which
-    for this corpus is often the point of the question.
-    """
-    import numpy as np
-
-    limit = clamp(limit, 20)
-    model = model or os.environ.get("SSRQ_EMBED_MODEL", "qwen3-embedding-0.6b")
-    chunk_ids, matrix = _load_matrix(model)
-
-    query = np.asarray(query_vector, dtype="float32")
-    if query.shape[0] != matrix.shape[1]:
-        raise ValueError(
-            f"query has {query.shape[0]} dimensions, index has {matrix.shape[1]}")
-    norm = float(np.linalg.norm(query)) or 1.0
-    scores = matrix @ (query / norm)
-
-    # Take a generous slice before filtering: the year filter and the per-entry
-    # cap both discard candidates.
-    fetch = min(len(chunk_ids), max(limit * 8, limit + 50))
-    candidates = np.argpartition(-scores, fetch - 1)[:fetch]
-    candidates = candidates[np.argsort(-scores[candidates])]
-    picked = [(chunk_ids[i], float(scores[i])) for i in candidates]
-
-    by_id = {}
-    with conn() as c:
-        for start in range(0, len(picked), 400):
-            window = picked[start:start + 400]
-            sql = _SEMANTIC_SQL.format(placeholders=",".join("?" * len(window)))
-            for row in c.execute(sql, [cid for cid, _ in window]).fetchall():
-                by_id[row["chunk_id"]] = row
-
-    out, seen = [], {}
-    for chunk_id, score in picked:
-        row = by_id.get(chunk_id)
-        if row is None:
-            continue                      # vector outlived its chunk
-        year = row["year"]
-        if year_from is not None and (year is None or year < year_from):
-            continue
-        if year_to is not None and (year is None or year > year_to):
-            continue
-        if seen.get(row["doc_id"], 0) >= per_document:
-            continue
-        seen[row["doc_id"]] = seen.get(row["doc_id"], 0) + 1
-        out.append({
-            "id": row["doc_id"],
-            "chunk_id": chunk_id,
-            "title": row["title"],
-            "canton": row["canton"],
-            "volume": row["volume"],
-            "year": year,
-            "year_to": row["origin_to"],
-            "lang": row["lang"],
-            "place": row["place"],
-            "url": row["url"],
-            "snippet": row["text"],
-            "score": round(score, 4),
-            "chunk_index": row["chunk_index"],
-            "char_start": row["char_start"],
-            "char_end": row["char_end"],
-        })
-        if len(out) >= limit:
-            break
-    return out
-
-def semantic_stats(model=None):
-    """Coverage of the semantic index, and the runs that produced it."""
-    with conn() as c:
-        if not c.execute("SELECT name FROM sqlite_master WHERE type='table' "
-                         "AND name='embeddings'").fetchone():
-            return {"indexed": False,
-                    "reason": "no embeddings table; run embed_db.py"}
-        by_model = c.execute(
-            "SELECT model, COUNT(*) n, MAX(dims) d FROM embeddings GROUP BY model"
-        ).fetchall()
-        n_chunks = c.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-        n_total = c.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
-        n_indexed = c.execute(
-            "SELECT COUNT(DISTINCT doc_id) FROM chunks").fetchone()[0]
-        runs = c.execute(
-            "SELECT run_id, started_at, finished_at, model, dims, n_chunks, notes "
-            "FROM embedding_runs ORDER BY started_at DESC LIMIT 5").fetchall()
-    return {
-        "indexed": bool(by_model),
-        "n_chunks": n_chunks,
-        "n_entries_indexed": n_indexed,
-        "n_entries_total": n_total,
-        "coverage": round(n_indexed / n_total, 4) if n_total else 0.0,
-        "models": [{"model": m["model"], "n_vectors": m["n"], "dims": m["d"]}
-                   for m in by_model],
-        "recent_runs": r(runs),
-    }
-
-
+# ── Semantic search: the shared vectorstore, with this corpus's join ─────────
+#
 # The columns are this corpus's, not Königsfelden's: short_id and source came
 # across with the copied machinery and do not exist here. A missing column is
 # not caught until a query runs, and inside a tool it reaches the caller as a
 # bare "Error executing tool search_semantic".
-_SEMANTIC_SQL = (
-    "SELECT c.chunk_id,c.doc_id,c.chunk_index,c.char_start,c.char_end,c.text,"
+_JOIN_SQL = (
+    "SELECT c.chunk_id,c.parent_id,c.chunk_index,c.char_start,c.char_end,c.text,"
     "e.title,e.canton,e.volume,e.origin_from AS year,e.origin_to,e.lang,e.place,e.url "
-    "FROM chunks c JOIN documents e ON e.id=c.doc_id "
+    "FROM chunks c JOIN documents e ON e.id=c.parent_id "
     "WHERE c.chunk_id IN ({placeholders})"
 )
 
 
+def passage_body(text: str, title, year) -> str:
+    """The passage without its head line (fleet rule, ch-h-bot#555).
+
+    Every passage carries `title origin_from` on its first line — for the
+    vector, which otherwise has no idea which document or century a window
+    belongs to. The reader does not need it there: the hit carries title and
+    year as fields, the bot's citation line shows them, and a snippet that
+    starts with them repeats the line above it, puts the head instead of the
+    text into the link's text fragment and hides the half-word a window may
+    start with from the bot's trimming (thodel/eperiodica_mcp#10). Only a
+    text that starts with exactly this document's head, built by the same
+    function that wrote it, is cut; a passage without one is left alone.
+    Offsets and vectors are untouched.
+    """
+    head = corpus.head_line(title, year)
+    if head and text.startswith(head + "\n"):
+        return text[len(head) + 1:]
+    return text
+
+
+def _row_to_hit(row, chunk_id: str, score: float, year_from=None, year_to=None):
+    """One joined row as a hit, or None when the year filter drops it."""
+    year = row["year"]
+    if year_from is not None and (year is None or year < year_from):
+        return None
+    if year_to is not None and (year is None or year > year_to):
+        return None
+    return {
+        "id": row["parent_id"],
+        "chunk_id": chunk_id,
+        "title": row["title"],
+        "canton": row["canton"],
+        "volume": row["volume"],
+        "year": year,
+        "year_to": row["origin_to"],
+        "lang": row["lang"],
+        "place": row["place"],
+        "url": row["url"],
+        "snippet": passage_body(row["text"], row["title"], year),
+        "score": score,
+        "chunk_index": row["chunk_index"],
+        "char_start": row["char_start"],
+        "char_end": row["char_end"],
+    }
+
+
+def search_semantic(query_vector, limit=20, model=None, year_from=None,
+                    year_to=None, per_parent=2):
+    """Passages closest in meaning to an already-embedded query.
+
+    ``per_parent`` caps how many passages one document may contribute, so a
+    long document cannot fill the result set and crowd out the other documents
+    that answer the question. ``year_from``/``year_to`` restrict to a period,
+    which for this corpus is often the point of the question.
+    """
+    return vectorstore.search(
+        conn, _DB_PATH, query_vector,
+        join_sql=_JOIN_SQL,
+        row_to_hit=lambda r, cid, sc: _row_to_hit(r, cid, sc, year_from, year_to),
+        limit=clamp(limit, 20), model=model, per_parent=per_parent)
+
+
+def semantic_stats() -> dict:
+    """Coverage of the semantic index, and the runs that produced it."""
+    return vectorstore.stats(conn, corpus.PARENT_TABLE)
+
+
 def warm_semantic_index(model):
     """Load the vectors now and report what was loaded, or why it could not be."""
-    try:
-        chunk_ids, matrix = _load_matrix(model)
-    except RuntimeError as exc:
-        return {"ready": False, "model": model, "reason": str(exc)}
-    return {"ready": True, "model": model, "n_chunks": len(chunk_ids),
-            "dims": int(matrix.shape[1]),
-            "megabytes": round(matrix.nbytes / 1_048_576, 1)}
-
+    return vectorstore.warm(conn, _DB_PATH, model)
 
 
 def set_db_path(path: str) -> None:
     global _DB_PATH
     _DB_PATH = path
+    vectorstore.clear_cache()      # the matrix is per (path, model)
 
 
 @contextmanager
