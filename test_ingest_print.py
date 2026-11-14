@@ -30,8 +30,10 @@ def test_ingest_keeps_editions_and_refuses_partial(tmp_path):
     conn.execute("INSERT INTO documents (id, canton, volume, title, text, n_chars) VALUES ('SSRQ-ZH-1', 'ZH', 'V', 't', 'x', 1)")
     conn.commit()
     conn.close()
+    partial = tmp_path / "partial"
+    partial.mkdir()
     with pytest.raises(SystemExit):
-        ingest_print.load(_export(tmp_path / "a", complete=False) if (tmp_path / "a").mkdir() is None else None, dbp)
+        ingest_print.load(_export(partial, complete=False), dbp)
     n_docs, n_reg = ingest_print.load(_export(tmp_path), dbp, quiet=True)
     assert (n_docs, n_reg) == (1, 1)
     conn = sqlite3.connect(dbp)
