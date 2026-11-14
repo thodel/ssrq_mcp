@@ -212,7 +212,9 @@ def update_dates(src: Path, db_path: str, quiet: bool = False) -> int:
 def build(src: Path, db_path: str, quiet: bool = False) -> int:
     conn = sqlite3.connect(db_path)
     conn.executescript(db_module.SCHEMA_SQL)
-    conn.execute("DELETE FROM documents")
+    db_module.ensure_document_source(conn)
+    # Only the editions: the printed volumes (source='print', ingest_print.py) stay.
+    conn.execute("DELETE FROM documents WHERE source = 'editio'")
     # External-content FTS: deleting rows corrupts the index, so it is rebuilt
     # from the table afterwards rather than maintained by trigger.
     conn.execute("INSERT INTO documents_fts(documents_fts) VALUES('delete-all')")
@@ -224,12 +226,12 @@ def build(src: Path, db_path: str, quiet: bool = False) -> int:
     for row in documents(src):
         batch.append(tuple(row[c] for c in cols))
         if len(batch) >= 500:
-            conn.executemany(f"INSERT OR REPLACE INTO documents VALUES ({placeholders})", batch)
+            conn.executemany(f"INSERT OR REPLACE INTO documents ({','.join(cols)}) VALUES ({placeholders})", batch)
             total += len(batch); batch.clear()
             if not quiet:
                 print(f"  {total} Dokumente …", file=sys.stderr)
     if batch:
-        conn.executemany(f"INSERT OR REPLACE INTO documents VALUES ({placeholders})", batch)
+        conn.executemany(f"INSERT OR REPLACE INTO documents ({','.join(cols)}) VALUES ({placeholders})", batch)
         total += len(batch)
 
     conn.execute("INSERT INTO documents_fts(documents_fts) VALUES('rebuild')")
