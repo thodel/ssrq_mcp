@@ -519,3 +519,16 @@ def related_persons(pid: str) -> dict[str, Any]:
                 out["places_note"] = ("No place authority table in this database; "
                                       "only the referenced ids are returned.")
         return out
+
+
+def ensure_document_source(conn) -> None:
+    """Columns that let the printed volumes (ssrq_print, ingest_print.py) share the documents table with the
+    editions: source = 'editio' | 'print', extra = JSON with what only the print volumes carry (regest,
+    transmission, viewer link, register ids). Idempotent; existing rows count as 'editio'."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(documents)")}
+    if "source" not in cols:
+        conn.execute("ALTER TABLE documents ADD COLUMN source TEXT NOT NULL DEFAULT 'editio'")
+    if "extra" not in cols:
+        conn.execute("ALTER TABLE documents ADD COLUMN extra TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_source ON documents(source)")
+
